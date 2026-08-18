@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent测试生成系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+
+        .main-panel {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+
+        .tabs {
+            display: flex;
+            background: #f8f9fa;
+            border-bottom: 2px solid #e9ecef;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+            color: #6c757d;
+        }
+
+        .tab.active {
+            background: white;
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+        }
+
+        .tab:hover {
+            background: #e9ecef;
+        }
+
+        .content {
+            padding: 30px;
+        }
+
+        .input-section {
+            margin-bottom: 20px;
+        }
+
+        .input-section label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #495057;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            font-size: 14px;
+            resize: vertical;
+            min-height: 80px;
+            font-family: inherit;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #667eea;
+            color: white;
+        }
+
+        .btn:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:disabled {
+            background: #adb5bd;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .result-section {
+            margin-top: 30px;
+            padding-top: 30px;
+            border-top: 2px solid #e9ecef;
+        }
+
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .result-header h3 {
+            color: #495057;
+        }
+
+        .badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .badge-error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .scenarios-list {
+            list-style: none;
+        }
+
+        .scenario-item {
+            padding: 12px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+
+        .scenario-priority {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 8px;
+        }
+
+        .priority-high {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .priority-medium {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+
+        .code-block {
+            background: #282c34;
+            color: #abb2bf;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6c757d;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error-message {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+
+        .examples {
+            margin-top: 15px;
+            padding: 15px;
+            background: #e7f3ff;
+            border-radius: 8px;
+        }
+
+        .examples h4 {
+            color: #004085;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .examples ul {
+            list-style: none;
+            font-size: 13px;
+            color: #004085;
+        }
+
+        .examples li {
+            padding: 4px 0;
+            cursor: pointer;
+        }
+
+        .examples li:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🤖 Agent测试生成系统</h1>
+            <p>自然语言驱动的智能测试用例生成</p>
+        </header>
+
+        <div class="main-panel">
+            <div class="tabs">
+                <div class="tab active" onclick="switchTab('requirement', this)">需求分析</div>
+                <div class="tab" onclick="switchTab('testpoints', this)">测试点生成</div>
+                <div class="tab" onclick="switchTab('generate', this)">测试生成</div>
+            </div>
+
+            <!-- 需求分析面板 -->
+            <div id="requirement-panel" class="content">
+                <div class="input-section">
+                    <label for="req-query">输入查询：</label>
+                    <textarea id="req-query" placeholder="例如：分析login.py的测试需求"></textarea>
+                    
+                    <!-- 飞书文档输入 -->
+                    <div style="margin-top: 15px; padding: 15px; background: #f0f7ff; border-radius: 8px; border-left: 4px solid #1890ff;">
+                        <label for="feishu-url-req" style="color: #1890ff; margin-bottom: 8px; display: block;">
+                            📄 或从飞书文档导入代码路径：
+                        </label>
+                        <div style="display: flex; gap: 10px;">
+                            <input 
+                                type="text" 
+                                id="feishu-url-req" 
+                                placeholder="粘贴飞书文档链接，如：https://xxx.feishu.cn/docx/xxxxx"
+                                style="flex: 1; padding: 10px; border: 2px solid #d9d9d9; border-radius: 6px; font-size: 14px;"
+                            />
+                            <button 
+                                class="btn" 
+                                onclick="importFeishuDocForReq()" 
+                                id="feishu-btn-req"
+                                style="padding: 10px 20px; white-space: nowrap;"
+                            >
+                                导入
+                            </button>
+                        </div>
+                        <small style="color: #666; margin-top: 5px; display: block;">
+                            💡 提示：导入后将自动解析PRD内容并生成分析查询
+                        </small>
+                    </div>
+                    
+                    <div class="examples">
+                        <h4>💡 示例（点击快速填充）：</h4>
+                        <ul>
+                            <li onclick="fillExample('req-query', '分析src/login.py的测试需求')">分析src/login.py的测试需求</li>
+                            <li onclick="fillExample('req-query', '检查utils/auth.py的API测试点')">检查utils/auth.py的API测试点</li>
+                            <li onclick="fillExample('req-query', '分析payment.js的移动端测试场景')">分析payment.js的移动端测试场景</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <button class="btn" onclick="analyzeRequirement()" id="req-btn">开始分析</button>
+
+                <div id="req-result" class="result-section" style="display:none;">
+                    <div class="result-header">
+                        <h3>分析结果</h3>
+                        <span id="req-badge" class="badge"></span>
+                    </div>
+                    <div id="req-content"></div>
+                </div>
+            </div>
+
+            <!-- 测试点生成面板 -->
+            <div id="testpoints-panel" class="content" style="display:none;">
+                <div class="input-section">
+                    <label for="tp-query">输入查询：</label>
+                    <textarea id="tp-query" placeholder="例如：根据login功能生成测试场景"></textarea>
+                    <div class="examples">
+                        <h4>💡 示例（点击快速填充）：</h4>
+                        <ul>
+                            <li onclick="fillExample('tp-query', '根据login和register功能生成测试场景')">根据login和register功能生成测试场景</li>
+                            <li onclick="fillExample('tp-query', '为支付流程生成边界和异常测试点')">为支付流程生成边界和异常测试点</li>
+                        </ul>
+                    </div>
+                </div>
+                <button class="btn" onclick="generateTestPoints()" id="tp-btn">生成测试点</button>
+                <div id="tp-result" class="result-section" style="display:none;">
+                    <div class="result-header">
+                        <h3>测试场景</h3>
+                        <span id="tp-badge" class="badge"></span>
+                    </div>
+                    <div id="tp-content"></div>
+                </div>
+            </div>
+
+            <!-- 测试生成分板 -->
+            <div id="generate-panel" class="content" style="display:none;">
+                <div class="input-section">
+                    <label for="gen-doc">需求文档（可选）：</label>
+                    <textarea id="gen-doc" placeholder="粘贴需求文档内容，或填写需求描述...\n例如：\n用户登录功能需求：\n1. 支持用户名密码登录\n2. 用户名长度6-20位\n3. 密码需包含大小写字母和数字\n4. 登录失败3次后锁定账户5分钟" style="min-height: 150px;"></textarea>
+                    
+                    <!-- 飞书文档输入 -->
+                    <div style="margin-top: 15px; padding: 15px; background: #f0f7ff; border-radius: 8px; border-left: 4px solid #1890ff;">
+                        <label for="feishu-url" style="color: #1890ff; margin-bottom: 8px; display: block;">
+                            📄 或从飞书文档导入：
+                        </label>
+                        <div style="display: flex; gap: 10px;">
+                            <input 
+                                type="text" 
+                                id="feishu-url" 
+                                placeholder="粘贴飞书文档链接，如：https://xxx.feishu.cn/docx/xxxxx"
+                                style="flex: 1; padding: 10px; border: 2px solid #d9d9d9; border-radius: 6px; font-size: 14px;"
+                            />
+                            <button 
+                                class="btn" 
+                                onclick="importFeishuDoc()" 
+                                id="feishu-btn"
+                                style="padding: 10px 20px; white-space: nowrap;"
+                            >
+                                导入
+                            </button>
+                        </div>
+                        <small style="color: #666; margin-top: 5px; display: block;">
+                            💡 提示：需要先在.env中配置FEISHU_APP_ID和FEISHU_APP_SECRET
+                        </small>
+                    </div>
+                </div>
+
+                <div class="input-section">
+                    <label for="gen-query">补充说明（可选）：</label>
+                    <textarea id="gen-query" placeholder="对需求文档的补充说明，或具体的测试要求...\n例如：为上述需求生成Web异常测试，重点关注边界条件"></textarea>
+                    
+                    <div class="examples">
+                        <h4>💡 示例（点击快速填充）：</h4>
+                        <ul>
+                            <li onclick="fillExample('gen-doc', '用户注册功能：\n1. 邮箱格式验证\n2. 密码强度检查（8-16位，含特殊字符）\n3. 验证码有效期5分钟\n4. 同一IP每小时最多注册3次')">用户注册功能需求</li>
+                            <li onclick="fillExample('gen-doc', '订单支付流程：\n1. 支持微信/支付宝/银行卡\n2. 支付超时30分钟自动取消\n3. 库存不足时提示并阻止支付\n4. 支付成功后发送通知')">订单支付功能需求</li>
+                            <li onclick="fillExample('gen-query', '为上述需求生成高优先级边界测试，包含超时处理')">补充：生成边界测试</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <button class="btn" onclick="generateTest()" id="gen-btn">生成测试</button>
+
+                <div id="gen-result" class="result-section" style="display:none;">
+                    <div class="result-header">
+                        <h3>生成结果</h3>
+                        <span id="gen-badge" class="badge"></span>
+                    </div>
+                    <div id="gen-content"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 切换标签页
+        function switchTab(tab, el) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('[id$="-panel"]').forEach(p => p.style.display = 'none');
+            el.classList.add('active');
+            document.getElementById(tab + '-panel').style.display = 'block';
+        }
+
+        // 填充示例
+        function fillExample(fieldId, text) {
+            document.getElementById(fieldId).value = text;
+        }
+
+        // 显示加载状态
+        function showLoading(btnId, resultId) {
+            document.getElementById(btnId).disabled = true;
+            const resultDiv = document.getElementById(resultId);
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>AI正在思考中...</p>
+                </div>
+            `;
+        }
+
+        // 隐藏加载状态
+        function hideLoading(btnId) {
+            document.getElementById(btnId).disabled = false;
+        }
+
+        // 需求分析
+        async function analyzeRequirement() {
+            const query = document.getElementById('req-query').value.trim();
+            if (!query) {
+                alert('请输入查询内容');
+                return;
+            }
+
+            showLoading('req-btn', 'req-result');
+
+            try {
+                const response = await fetch('/api/requirement', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query})
+                });
+
+                const data = await response.json();
+                hideLoading('req-btn');
+
+                if (data.success) {
+                    displayRequirementResult(data);
+                } else {
+                    showError('req-result', data.error);
+                }
+            } catch (error) {
+                hideLoading('req-btn');
+                showError('req-result', '网络错误: ' + error.message);
+            }
+        }
+
+        // 显示需求分析结果
+        function displayRequirementResult(data) {
+            const badge = document.getElementById('req-badge');
+            badge.className = 'badge badge-success';
+            badge.textContent = `✓ ${data.test_scenarios.length} 个场景`;
+
+            let html = '<ul class="scenarios-list">';
+            data.test_scenarios.forEach(scenario => {
+                const priorityClass = `priority-${scenario.priority}`;
+                html += `
+                    <li class="scenario-item">
+                        <span class="scenario-priority ${priorityClass}">${scenario.priority}</span>
+                        <strong>${scenario.description}</strong>
+                        <br><small style="color:#6c757d">测试点: ${scenario.test_points.join(', ')}</small>
+                    </li>
+                `;
+            });
+            html += '</ul>';
+
+            document.getElementById('req-content').innerHTML = html;
+        }
+
+        // 生成测试点
+        async function generateTestPoints() {
+            const query = document.getElementById('tp-query').value.trim();
+            if (!query) { alert('请输入查询内容'); return; }
+
+            showLoading('tp-btn', 'tp-result');
+
+            try {
+                const response = await fetch('/api/test_points', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query})
+                });
+                const data = await response.json();
+                hideLoading('tp-btn');
+
+                if (data.success) {
+                    const badge = document.getElementById('tp-badge');
+                    badge.className = 'badge badge-success';
+                    badge.textContent = `✓ ${data.scenarios.length} 个场景`;
+
+                    let html = '<ul class="scenarios-list">';
+                    data.scenarios.forEach(s => {
+                        const pc = `priority-${s.priority || 'medium'}`;
+                        html += `<li class="scenario-item">
+                            <span class="scenario-priority ${pc}">${s.priority || 'medium'}</span>
+                            <strong>${s.description}</strong>
+                            <br><small style="color:#6c757d">测试点: ${(s.test_points || []).join(', ')}</small>
+                        </li>`;
+                    });
+                    html += '</ul>';
+                    document.getElementById('tp-content').innerHTML = html;
+                } else {
+                    showError('tp-result', data.error);
+                }
+            } catch (error) {
+                hideLoading('tp-btn');
+                showError('tp-result', '网络错误: ' + error.message);
+            }
+        }
+
+        // 生成测试
+        async function generateTest() {
+            const doc = document.getElementById('gen-doc').value.trim();
+            const query = document.getElementById('gen-query').value.trim();
+            
+            if (!doc && !query) {
+                alert('请输入需求文档或补充说明');
+                return;
+            }
+
+            showLoading('gen-btn', 'gen-result');
+
+            try {
+                const response = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        requirement_doc: doc,
+                        query: query
+                    })
+                });
+
+                const data = await response.json();
+                hideLoading('gen-btn');
+
+                if (data.success) {
+                    displayGenerateResult(data);
+                } else {
+                    showError('gen-result', data.error);
+                }
+            } catch (error) {
+                hideLoading('gen-btn');
+                showError('gen-result', '网络错误: ' + error.message);
+            }
+        }
+
+        // 显示测试结果
+        function displayGenerateResult(data) {
+            const badge = document.getElementById('gen-badge');
+            badge.className = 'badge badge-success';
+            badge.textContent = '✓ 生成成功';
+
+            const html = `
+                <p style="margin-bottom:15px;color:#495057">
+                    <strong>文件路径:</strong> ${data.file_path}
+                </p>
+                <pre class="code-block"><code>${escapeHtml(data.test_code)}</code></pre>
+            `;
+
+            document.getElementById('gen-content').innerHTML = html;
+        }
+
+        // 显示错误
+        function showError(resultId, message) {
+            const badge = document.querySelector(`#${resultId} .badge`);
+            badge.className = 'badge badge-error';
+            badge.textContent = '✗ 失败';
+
+            document.getElementById(resultId.replace('-result', '-content')).innerHTML = `
+                <div class="error-message">${message}</div>
+            `;
+        }
+
+        // HTML转义
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // 导入飞书文档
+        async function importFeishuDoc() {
+            const docUrl = document.getElementById('feishu-url').value.trim();
+            if (!docUrl) {
+                alert('请输入飞书文档链接');
+                return;
+            }
+
+            const btn = document.getElementById('feishu-btn');
+            btn.disabled = true;
+            btn.textContent = '导入中...';
+
+            try {
+                const response = await fetch('/api/feishu/parse', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({doc_url: docUrl})
+                });
+
+                const data = await response.json();
+                btn.disabled = false;
+                btn.textContent = '导入';
+
+                if (data.success) {
+                    // 将文档内容填充到需求文档框
+                    document.getElementById('gen-doc').value = data.content;
+                    
+                    // 显示成功提示
+                    showImportNotice('feishu-url', `✓ 成功导入飞书${data.doc_type === 'doc' ? '文档' : data.doc_type === 'wiki' ? '知识库' : '表格'} (${data.content.length} 字符)`);
+                } else {
+                    alert('导入失败: ' + data.error);
+                }
+            } catch (error) {
+                btn.disabled = false;
+                btn.textContent = '导入';
+                alert('网络错误: ' + error.message);
+            }
+        }
+
+        // 为需求分析导入飞书文档
+        async function importFeishuDocForReq() {
+            const docUrl = document.getElementById('feishu-url-req').value.trim();
+            if (!docUrl) {
+                alert('请输入飞书文档链接');
+                return;
+            }
+
+            const btn = document.getElementById('feishu-btn-req');
+            btn.disabled = true;
+            btn.textContent = '解析中...';
+
+            try {
+                const response = await fetch('/api/feishu/parse', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({doc_url: docUrl})
+                });
+
+                const data = await response.json();
+                btn.disabled = false;
+                btn.textContent = '导入';
+
+                if (data.success) {
+                    // 将PRD文档内容直接填充到查询框
+                    const content = data.content;
+                    document.getElementById('req-query').value = `根据以下需求文档分析测试需求：\n\n${content}`;
+                    
+                    showImportNotice('feishu-url-req', `✓ 成功导入飞书${data.doc_type === 'doc' ? '文档' : data.doc_type === 'wiki' ? '知识库' : '表格'} (${content.length} 字符)`);
+                } else {
+                    alert('导入失败: ' + data.error);
+                }
+            } catch (error) {
+                btn.disabled = false;
+                btn.textContent = '导入';
+                alert('网络错误: ' + error.message);
+            }
+        }
+
+        // 从文本中提取文件路径
+        function extractFilePaths(text) {
+            const patterns = [
+                /([\w./-]+\.py)/g,
+                /([\w./-]+\.js)/g,
+                /([\w./-]+\.ts)/g,
+                /([\w./-]+\.java)/g,
+                /([\w./-]+\.go)/g
+            ];
+            
+            const paths = new Set();
+            patterns.forEach(pattern => {
+                const matches = text.match(pattern);
+                if (matches) {
+                    matches.forEach(match => paths.add(match));
+                }
+            });
+            
+            return Array.from(paths);
+        }
+
+        // 显示导入提示
+        function showImportNotice(inputId, message) {
+            const inputEl = document.getElementById(inputId);
+            const container = inputEl.parentElement.parentElement;
+            
+            // 移除旧提示
+            const existingNotice = container.querySelector('.import-notice');
+            if (existingNotice) {
+                existingNotice.remove();
+            }
+            
+            // 创建新提示
+            const notice = document.createElement('div');
+            notice.className = 'import-notice';
+            notice.style.cssText = 'background: #d4edda; color: #155724; padding: 10px; border-radius: 6px; margin-top: 10px; font-size: 13px;';
+            notice.textContent = message;
+            container.appendChild(notice);
+            
+            // 3秒后自动消失
+            setTimeout(() => notice.remove(), 3000);
+        }
+
+        // 回车提交
+        document.getElementById('req-query').addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'Enter') {
+                analyzeRequirement();
+            }
+        });
+
+        document.getElementById('gen-query').addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'Enter') {
+                generateTest();
+            }
+        });
+
+        document.getElementById('tp-query').addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'Enter') {
+                generateTestPoints();
+            }
+        });
+    </script>
+</body>
+</html>
