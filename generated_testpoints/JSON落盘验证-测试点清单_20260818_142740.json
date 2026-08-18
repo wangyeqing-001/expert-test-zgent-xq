@@ -1,0 +1,78 @@
+{
+  "title": "JSON落盘验证-测试点清单",
+  "total": 12,
+  "test_points": [
+    {
+      "id": "01",
+      "endpoint": "客户端",
+      "detail": "search_input - normal场景1功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "02",
+      "endpoint": "客户端",
+      "detail": "search_input - edge_case场景2功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "03",
+      "endpoint": "客户端",
+      "detail": "search_input - error_handling场景3功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "04",
+      "endpoint": "客户端",
+      "detail": "search_input - normal场景4功能逻辑",
+      "priority": "P2"
+    },
+    {
+      "id": "05",
+      "endpoint": "客户端",
+      "detail": "guess_like_search - normal场景5功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "06",
+      "endpoint": "客户端",
+      "detail": "guess_like_search - edge_case场景6功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "07",
+      "endpoint": "客户端",
+      "detail": "guess_like_search - error_handling场景7功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "08",
+      "endpoint": "客户端",
+      "detail": "guess_like_search - normal场景8功能逻辑",
+      "priority": "P2"
+    },
+    {
+      "id": "09",
+      "endpoint": "客户端",
+      "detail": "result_rank - normal场景9功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "10",
+      "endpoint": "客户端",
+      "detail": "result_rank - edge_case场景10功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "11",
+      "endpoint": "客户端",
+      "detail": "result_rank - error_handling场景11功能逻辑",
+      "priority": "P1"
+    },
+    {
+      "id": "12",
+      "endpoint": "客户端",
+      "detail": "result_rank - normal场景12功能逻辑",
+      "priority": "P2"
+    }
+  ]
+}
