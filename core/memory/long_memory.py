@@ -10,7 +10,10 @@ class LongTermMemory(BaseMemory):
     
     def __init__(self, agent_name: str):
         self.agent_name = agent_name
-        self.memory_file = f"memory_{agent_name}.json"
+        # 记忆文件存储在可配置目录，默认 memory_data/
+        memory_dir = os.getenv('MEMORY_DIR', 'memory_data')
+        os.makedirs(memory_dir, exist_ok=True)
+        self.memory_file = os.path.join(memory_dir, f"memory_{agent_name}.json")
         self.data = {}
         self.experience_log = []
         

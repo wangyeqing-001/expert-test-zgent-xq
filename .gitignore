@@ -38,6 +38,7 @@ ENV/
 
 # Memory Files
 memory_*.json
+memory_data/
 
 # Generated Tests
 generated_tests/
