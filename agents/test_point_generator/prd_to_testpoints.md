@@ -23,10 +23,10 @@
 - **P2**：UI展示偏差、非核心交互瑕疵、次要文案错误（前提是需求或UI稿有明确标准）。
 
 ## 输出 JSON 结构（硬约束）
-输出一个 JSON 对象，顶层包含三个分组键：
+输出一个 JSON 对象，顶层仅包含一个分组键：
 - `client`：值是一个对象，包含 `app`、`web`、`h5`、`common` 四个数组
-- `backend`：值是一个数组（后端服务接口/逻辑相关）
-- `operation_backend`：值是一个数组（运营/管理后台相关）
+
+注：本系统为客户端测试用例生成系统，仅提取客户端测试点，不涉及后端服务/管理后台测试。
 
 **每个测试点对象包含五个字段**：
 ```json
@@ -40,8 +40,7 @@
 - 需求明确写 `web` 端 → 放入 `client.web`
 - 需求明确写 `h5` 端 → 放入 `client.h5`
 - 需求未明确区分端，统一写 `客户端` → 放入 `client.common`
-- 需求明确写 `后台` → 放入 `operation_backend`
-- 需求明确写 `后端` → 放入 `backend`
+- 后端服务/管理后台相关的需求不提取测试点（本系统仅聚焦客户端测试）
 
 ## 排序规则
 - 每个数组内，按 `P0` > `P1` > `P2` 顺序排列，同优先级内无明显顺序要求。
@@ -66,12 +65,5 @@
       {"id": "03", "detail": "个人主页 - 关注按钮 - 状态切换反馈", "priority": "P1", "source": "prd", "type": "normal"},
       {"id": "04", "detail": "组合详情页 - 极端分辨率下 - 布局适配", "priority": "P2", "source": "prd", "type": "edge_case"}
     ]
-  },
-  "backend": [
-    {"id": "05", "detail": "用户服务 - 权限校验 - 越权访问防护", "priority": "P0", "source": "prd", "type": "error_handling"}
-  ],
-  "operation_backend": [
-    {"id": "06", "detail": "内容审核 - 审核结果 - 状态同步至客户端", "priority": "P1", "source": "prd", "type": "normal"},
-    {"id": "07", "detail": "数据导出 - 用户手机号 - 自动脱敏处理", "priority": "P0", "source": "prd", "type": "edge_case"}
-  ]
+  }
 }

@@ -186,14 +186,12 @@ class TestPointGenerator(BaseAgent):
     
     # ---------- prd直提链路（端分组JSON → 四列测试点，跳过scenarios中间层） ----------
     
-    # 端分组键路径 → 涉及端
+    # 端分组键路径 → 涉及端（本系统聚焦客户端测试，不提取后端/管理后台测试点）
     _GROUP_ENDPOINT_MAP = [
         (('client', 'app'), 'app'),
         (('client', 'web'), 'web'),
         (('client', 'h5'), 'h5'),
         (('client', 'common'), '客户端'),
-        (('backend',), '后端'),
-        (('operation_backend',), '后台'),
     ]
     
     # 合法测试点类型（供下游分批）

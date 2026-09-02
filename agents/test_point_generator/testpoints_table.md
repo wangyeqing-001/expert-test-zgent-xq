@@ -9,13 +9,13 @@
 **核心原则**：仅做格式转换和渲染适配，不新增、不修改、不删减测试点内容。
 
 ## 输入适配（自动识别两种格式）
-- **格式A（端分组JSON对象）**：顶层包含 `client`、`backend`、`operation_backend`，各端下为测试点数组，每个测试点包含 `id`、`detail`、`priority`。
+- **格式A（端分组JSON对象）**：顶层包含 `client`（含 `app`/`web`/`h5`/`common` 各端数组），每个测试点包含 `id`、`detail`、`priority`。
 - **格式B（平铺JSON数组）**：直接为测试点数组，每个元素包含 `id`、`platform`、`detail`、`priority`。
 
 **映射规则**：
 - 格式A：遍历各端数组，将 `id` → `测试点ID`，`detail` → `测试点详情`，`priority` → `优先级`，端名按规则映射为 `涉及端`。
 - 格式B：`platform` → `涉及端`，`id` → `测试点ID`，`detail` → `测试点详情`，`priority` → `优先级`。
-- 端名映射：`app` → `app`，`web` → `web`，`h5` → `h5`，`common` → `客户端`，`backend` → `后端`，`operation_backend` → `后台`。
+- 端名映射：`app` → `app`，`web` → `web`，`h5` → `h5`，`common` → `客户端`。
 
 ## 输出节点类型（仅允许以下7种）
 1. `{"type":"h1","text":"..."}`
@@ -38,7 +38,7 @@
 3. **h2**：`测试点明细表`
 4. **table 块**：根据拆表规则，可能包含多个 table 对象
    - headers: `测试点ID | 涉及端 | 测试点详情 | 优先级`
-   - 数据行：按 `app` → `web` → `h5` → `客户端` → `后台` → `后端` 排序
+   - 数据行：按 `app` → `web` → `h5` → `客户端` 排序
 5. **h2**：`优先级分布`
 6. **table**：单一表格
    - headers: `优先级 | 数量 | 占比`
