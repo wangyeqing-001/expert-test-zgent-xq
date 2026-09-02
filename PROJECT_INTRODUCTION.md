@@ -9,13 +9,14 @@
 
 - **多Agent协作架构**：需求分析Agent + 测试点生成Agent + 测试生成Agent + 编排器协调（3步流水线）
 - **完整ReAct实现**：思考(Reasoning) + 行动(Acting)循环，包含记忆、工具、规划、反思四大模块
-- **飞书文档集成**：需求分析结果自动写入飞书文档（指定文件夹），支持在线协作评审
-- **下游Agent数据传递**：需求分析Markdown通过结构化解析自动传递给测试点/测试生成Agent
+- **飞书文档全链路集成**：需求分析与测试点均自动写入飞书文档（结构化JSON直写原生块），支持在线协作评审
+- **测试点双链路架构**：PRD直提（原始需求主材料+约束清单辅助门控）与代码分析链路并行，统一产出纯文本对齐四列表格 + JSON落盘
+- **下游数据传递**：测试点JSON（六字段schema）落盘供用例生成分批消费；需求分析文结构化解析传下游
 - **自然语言交互**：支持中文/英文自然语言指令，智能解析用户意图
 - **多LLM提供商支持**：阿里云百炼(DashScope)、DeepSeek、OpenAI GPT-4，三级优先级自动切换
 - **多测试类型覆盖**：Web UI (Playwright/Selenium)、移动端 (Appium)、API (requests)
-- **三渠道接入**：CLI交互式 + Web图形界面 + 飞书机器人对话（均为Agent调用渠道）
-- **降级容错机制**：LLM失败时自动降级到规则模板，保证系统可用性
+- **多渠道接入**：CLI交互式 + Web图形界面 + 飞书机器人对话 + 飞书链接独立脚本（均为Agent调用渠道）
+- **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性
 
 ---
 
@@ -27,27 +28,32 @@
 PythonProject_testagent/
 ├── agents/                        # 业务智能体层
 │   ├── base_agent.py             # Agent基类（ReAct标准接口）
-│   ├── _prompt_utils.py          # Prompt加载工具（共享）
+│   ├── _prompt_utils.py          # Prompt加载工具（共享，占位符校验+注入）
 │   ├── requirement_analyzer/     # 需求分析Agent
-│   │   ├── agent.py              # 分析逻辑 + 飞书文档写入
-│   │   └── prompts.md            # 需求分析提示词（纯文本，可直接编辑）
+│   │   ├── agent.py              # 双链路分析 + 飞书struct直写 + 原始文档透出
+│   │   ├── prompts.md            # 结构化JSON输出提示词（主链路）
+│   │   └── prompts_markdown.md   # Markdown降级提示词（灰度兜底）
 │   ├── test_point_generator/     # 测试点生成Agent
-│   │   ├── agent.py              # 需求→测试场景转化
-│   │   ├── generate_scenarios.md # 场景生成提示词（纯文本）
-│   │   └── prd_to_testpoints.md  # PRD转测试点提示词（纯文本）
+│   │   ├── agent.py              # 双链路：prd直提 + code场景
+│   │   ├── prd_to_testpoints.md  # prd直提提示词（主辅材料+门控指令）
+│   │   ├── constraints_extract.md# 分支A：约束清单提取提示词
+│   │   ├── testpoints_table.md   # code链路阶段2：四列表格规范（用户方法论）
+│   │   └── generate_scenarios.md # code链路阶段1：场景生成提示词
 │   ├── test_generator/           # 测试代码生成Agent（ReAct）
 │   │   ├── agent.py              # 场景→可执行测试代码
-│   │   ├── generate_test.md      # 通用测试生成提示词（纯文本）
-│   │   ├── web_test.md           # Web测试提示词（纯文本）
-│   │   ├── mobile_test.md        # 移动端测试提示词（纯文本）
-│   │   └── api_test.md           # API测试提示词（纯文本）
+│   │   ├── generate_test.md      # 通用测试生成提示词
+│   │   ├── web_test.md           # Web测试提示词
+│   │   ├── mobile_test.md        # 移动端测试提示词
+│   │   └── api_test.md           # API测试提示词
 │   └── orchestrator/             # Agent编排器
 │       └── agent.py              # 3步流水线协调
 │
 ├── core/                          # 框架核心组件
 │   ├── llm_client.py             # LLM客户端（百炼/DeepSeek/OpenAI）
-│   ├── feishu_client.py          # 飞书API客户端（文档读写，token自动刷新）
+│   ├── feishu_client.py          # 飞书API客户端（struct直写原生块，token自动刷新）
 │   ├── feishu_bot.py             # 飞书机器人（意图路由 + Agent调度）
+│   ├── structured_doc.py         # 结构化文档模型（8种业务节点 ↔ 飞书原生块）
+│   ├── dispatcher.py             # 通用意图路由器（三渠道共用）
 │   ├── memory/                   # 记忆模块
 │   │   ├── base_memory.py        # 记忆基类
 │   │   ├── working_memory.py     # 工作记忆（短期）
@@ -62,16 +68,20 @@ PythonProject_testagent/
 │   ├── code_analyzer.py          # 代码结构分析器
 │   └── template_loader.py        # 测试模板加载器
 │
-├── prompts/                       # 提示词仓库
-│   └── base_prompts.py           # 基础提示词模板
-│
 ├── generated_tests/               # 测试代码输出
-├── generated_requirements/        # 需求分析Markdown输出
+├── generated_requirements/        # 需求分析文档输出
+├── generated_testpoints/          # 测试点输出（对齐表格.md + JSON落盘）
+├── tests/                         # 单元测试（structured_doc等）
+├── demo/                          # 示例被分析代码
 ├── web/                           # Web前端资源
 │   └── index.html                # 前端页面
 │
-├── main.py                        # CLI入口（3步流水线）
-├── web_server.py                 # Flask Web服务（含/api/pipeline）
+├── main.py                        # CLI入口（完整流水线 + 单独Agent调用）
+├── run_requirement.py            # 独立脚本：飞书文档链接 → 需求分析（一步到位）
+├── web_server.py                 # Flask Web服务（含/api/pipeline、/api/feishu/parse）
+├── test_feishu_integration.py    # 集成验证：飞书PRD导入→需求分析→测试点全流程
+├── test_requirement_analyzer.py  # 集成验证：3步流水线（需求分析→测试点）
+├── test_optimization.py          # 集成验证：优化后的Agent流水线（DeepSeek）
 ├── requirements.txt              # Python依赖
 └── .env                          # 环境变量配置
 ```
@@ -106,52 +116,64 @@ PythonProject_testagent/
 
 ### 2. RequirementAnalyzer（需求分析Agent）
 
-**职责**：从源代码中提取测试需求和场景，并将结果写入飞书文档 + 传递给下游Agent
+**职责**：分析代码文件或PRD/飞书需求文档，产出结构化需求分析书，写入飞书并向下游透出原始文档
+
+**输入支持**：
+- 代码文件路径（CodeAnalyzer结构分析）
+- PRD文本（粘贴/上传）
+- 飞书文档链接（自动拉取内容，支持 docx/wiki）
+
+**双链路灰度架构**：
+```
+新链路（USE_STRUCT_OUTPUT=True）：prompts.md 输出业务JSON
+  → parse_struct_json校验 → struct节点直写飞书原生块
+  → 失败降级：重新调LLM用prompts_markdown.md产出Markdown（旧链路）
+旧链路：prompts_markdown.md → Markdown解析写飞书
+```
 
 **工作流程**：
 ```
-输入：file_path + test_type
+输入：file_path / PRD文本 / 飞书链接
   ↓
-代码结构分析（CodeAnalyzer）
+文档清洗（去图片占位/@提及/URL行/模板套话，幂等）
   ↓
-LLM提取功能点 & 测试点
+LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
   ↓
-LLM生成测试场景列表
+保存 generated_requirements/ + 飞书struct直写（FEISHU_OUTPUT_FOLDER）
   ↓
-保存Markdown到 generated_requirements/
-  ↓
-写入飞书文档（指定文件夹 ECD7fz3gtlKapJdwY8kcsFPMnvh）
-  ↓
-输出：requirements + test_scenarios + markdown + feishu_doc
+输出：markdown + local_path + feishu_url + raw_content + metadata
 ```
-
-**关键方法**：
-- `execute(input_data)`：结构化分析入口（自动触发飞书写入）
-- `process_query(query)`：自然语言处理入口
-- `_save_and_publish(markdown, doc_title)`：本地保存 + 飞书文档写入
-- `_extract_requirements_with_llm()`：LLM智能提取
-- `_generate_scenarios_with_llm()`：场景智能生成
-
-**双输出机制**：
-- **飞书文档**：通过 `FeishuClient.create_doc(folder_token)` 写入飞书
-- **下游传递**：返回 `markdown` 字段，由编排器解析后传入下游Agent
+**关键输出字段**：
+- `raw_content`：清洗后的原始需求全文（供测试点prd直提作主材料）
+- `metadata.source`：`prd_document` / `feishu_doc` / 代码（下游据此选链路）
+- `metadata.title`：动态标题（从文档提取，传递给飞书文档命名）
 
 ### 3. TestPointGenerator（测试点生成Agent）
 
-**职责**：将需求分析结果转化为测试场景描述
+**职责**：从需求提取原子化测试点，产出四列表格（飞书/本地）+ JSON落盘供下游用例生成分批消费
 
-**工作流程**：
+**双链路架构（按需求来源自动选择）**：
+
 ```
-输入：requirements（结构化需求列表） + markdown（原始Markdown）
-  ↓
-LLM解析需求 + 生成测试场景
-  ↓
-输出：测试场景列表（JSON）
+链路1：prd直提（source='prd'，需求来自PRD/飞书文档）
+  原始PRD全文（主材料，唯一事实来源）
+    ├→ 分支A：constraints_extract.md 提取约束清单（防遗漏索引）
+    └→ 主流程：prd_to_testpoints.md（辅助材料注入门控：不作事实来源/无视推测/冲突以PRD为准）
+      ↓ 一次LLM直出端分组JSON（client.app/web/h5/common、backend、operation_backend）
+      ↓ 代码平铺为测试点（统一重编号01递增）+ 确定性对齐表格渲染（不二次调LLM）
+
+链路2：code分析（source='code'）
+  generate_scenarios.md 生成scenarios → testpoints_table.md（用户方法论）二次LLM生成四列表格JSON
 ```
+
+**统一产出（两条链路同格式）**：
+- **测试点JSON**（六字段）：`{id, endpoint, detail, priority, source, type}`，落盘 `generated_testpoints/{标题}_{时间戳}.json`，source供下游追溯、type（normal/edge_case/error_handling）供分批
+- **纯文本对齐四列表格**：`测试点ID | 涉及端 | 测试点详情 | 优先级`，CJK宽度对齐，飞书以code块（block_type=14）写入规避渲染风险；本地.md同步保存
+- 降级：JSON失败时确定性渲染同源数据，产出不断
 
 **关键方法**：
-- `execute(input_data)`：结构化输入（requirements列表 + test_type）
-- `process_query(query, context)`：自然语言输入（自动提取需求，可独立调用）
+- `execute(input_data)`：结构化入口（支持 `raw_prd` / `structured_constraints` 可选参数）
+- `process_query(query, context)`：自然语言入口（可独立调用）
 
 ### 4. TestGeneratorAgent（测试生成Agent）
 
@@ -201,11 +223,11 @@ LLM生成测试代码
 
 **工作流步骤**：
 ```
-Step 1: RequirementAnalyzer 分析代码 → 写入飞书 + 返回Markdown
+Step 1: RequirementAnalyzer 分析代码/PRD/飞书链接 → 写入飞书 + 返回分析文与raw_content
   ↓
-Step 2: _extract_requirements 解析Markdown为结构化需求列表
+Step 2: 按metadata.source选链路：prd/feishu来源→source='prd'+透传raw_prd；代码→解析Markdown为结构化需求
   ↓
-Step 3: TestPointGenerator 接收需求 → 生成测试场景（JSON）
+Step 3: TestPointGenerator 双链路产出测试点（四列表格 + JSON落盘）
   ↓
 Step 4: TestGeneratorAgent 逐个场景生成可执行测试代码
   ↓
@@ -325,6 +347,13 @@ python main.py
 >>> quit
 ```
 
+#### 飞书链接直连需求分析（独立脚本）
+```bash
+# 一步完成：飞书文档拉取 → 需求分析 → 写飞书 + 本地落盘，全程分步耗时日志
+python run_requirement.py https://your_company.feishu.cn/docx/xxxxx
+# 也支持 /wiki/ 路径，自动解析token与文档类型、继承文档标题
+```
+
 **可用命令**：
 - `req <查询>`：调用需求分析Agent
 - `tp <查询>`：调用测试点生成Agent
@@ -385,6 +414,13 @@ Content-Type: application/json
 {
   "query": "根据login功能生成测试场景"
 }
+
+# 模式C：prd直提（可选参数）
+{
+  "requirements": [{"description": "需求文本"}],
+  "raw_prd": "原始PRD全文（缺省时用description）",
+  "structured_constraints": "外部约束清单（不传则自动跑分支A提取）"
+}
 ```
 
 **4. 单独测试生成**
@@ -407,7 +443,20 @@ Content-Type: application/json
 GET /api/status
 ```
 
-**6. 飞书机器人事件回调**
+**6. 飞书文档链接解析**
+```http
+POST /api/feishu/parse
+Content-Type: application/json
+
+{
+  "doc_url": "https://your_company.feishu.cn/docx/xxxxx"
+}
+
+# 返回：success + content（文档内容）+ doc_type + doc_token
+# 供前端飞书链接输入框预检与内容预览使用（支持 docx/wiki）
+```
+
+**7. 飞书机器人事件回调**
 ```http
 POST /api/feishu/event
 Content-Type: application/json
@@ -433,7 +482,7 @@ Content-Type: application/json
 - 「为login函数生成Web测试用例」→ 调用测试代码生成Agent
 - 「帮助」→ 查看使用说明
 
-意图识别：关键词规则匹配（零延迟）→ LLM分类（兆底）
+意图识别：关键词规则匹配（零延迟）→ LLM分类（兜底）
 
 ---
 
@@ -447,33 +496,19 @@ req_agent = RequirementAnalyzer(llm_client=api_key)
 result = req_agent.process_query("分析demo/login.py的测试需求")
 ```
 
-**输出**：
+**输出**（新链路）：
 ```json
 {
-  "requirements": [
-    {
-      "function": "login",
-      "params": ["username", "password"],
-      "complexity": "medium",
-      "test_points": ["UI交互", "参数验证"]
-    }
-  ],
-  "test_scenarios": [
-    {
-      "function": "login",
-      "scenario": "normal",
-      "description": "测试login正常流程",
-      "priority": "high",
-      "test_points": ["UI交互", "参数验证"]
-    },
-    {
-      "function": "login",
-      "scenario": "error_handling",
-      "description": "测试login异常处理",
-      "priority": "high",
-      "test_points": ["错误恢复", "降级处理"]
-    }
-  ]
+  "markdown": "需求分析：...",              // 结构化文本（h1-h3/段落/列表/表格/code）
+  "local_path": "generated_requirements/xxx.md",
+  "feishu_url": "https://xueqiu.feishu.cn/docx/xxx",
+  "feishu_doc": "xxx",
+  "raw_content": "原始需求文档清洗后全文",   // 供下游prd直提作主材料
+  "metadata": {
+    "source": "prd_document",                // prd_document/feishu_doc/代码
+    "title": "AI搜索一期",
+    "model": "qwen-plus"
+  }
 }
 ```
 
@@ -521,16 +556,15 @@ result = orchestrator.execute_workflow(
 )
 
 # 流水线执行过程：
-# Step 1: RequirementAnalyzer 分析代码 → 写入飞书文档
-# Step 2: _extract_requirements 解析Markdown为结构化需求
-# Step 3: TestPointGenerator 生成测试场景
+# Step 1: RequirementAnalyzer 分析代码/PRD/飞书链接 → struct直写飞书文档
+# Step 2: 按metadata.source选链路（prd直提透传raw_prd / 代码解析结构化需求）
+# Step 3: TestPointGenerator 双链路产出测试点（四列表格写飞书 + JSON落盘）
 # Step 4: TestGeneratorAgent 生成可执行测试代码
 #
 # 输出：
 # ✓ 需求分析完成，飞书文档已创建
-# ✓ 解析到 3 个功能点
-# ✓ 生成 7 个测试场景
-# ✓ 流水线完成！共生成 7 个测试文件
+# ✓ 测试点已写入飞书（code块四列表格）+ JSON落盘
+# ✓ 流水线完成！共生成 N 个测试文件
 ```
 
 ---
@@ -614,8 +648,9 @@ LLM调用成功 → 智能生成高质量代码
 - `base_url` 全链路传递，无缝切换不同模型
 
 ### 6. 飞书文档集成 + 机器人交互
-- 需求分析结果自动写入飞书文档
-- 支持在线协作评审
+- 需求分析与测试点均自动写入飞书文档，支持在线协作评审
+- **struct直写原生块**：业务JSON ↔ structured_doc模型 ↔ 飞书原生块，无Markdown解析损耗；h1-h3/段落/列表/表格/code 8种节点
+- 表格对齐规则（CJK宽度）与表格宽度自适应（列数×平均列宽≤页面宽度才设width，防横向溢出）在Agent侧确定性生成
 - 通过 `FEISHU_OUTPUT_FOLDER` 环境变量指定目标文件夹
 - 飞书域名通过 `FEISHU_DOMAIN` 环境变量配置（默认 `xueqiu.feishu.cn`）
 - `access_token` 自动过期刷新（提前60秒续期，避免长时间运行后失效）
@@ -628,16 +663,23 @@ LLM调用成功 → 智能生成高质量代码
 - 编辑prompt无需理解Python语法，不会误删代码
 - 启动时自动校验占位符是否存在，缺失即报错
 
+### 8. 主辅材料双输入设计（测试点prd直提）
+- **主材料**：原始PRD全文，唯一事实来源，所有测试点必须回溯至PRD原文
+- **辅助材料**：约束清单（分支A自动提取或外部注入），仅作防遗漏索引
+- **门控指令**：辅助材料不作事实来源、无视"推荐默认值/置信度"等推测性内容、冲突以PRD为准
+- 效果：降低幻觉，兼顾覆盖率与可解释性
+
 ---
 
 ## 📊 项目统计
 
-- **代码行数**：约 2500+ 行
-- **核心模块**：5个Agent + 6个核心组件
+- **代码行数**：约 4000+ 行
+- **核心模块**：5个Agent + 8个核心组件
 - **支持测试类型**：3种（Web/Mobile/API）
 - **支持LLM提供商**：3种（百炼DashScope/DeepSeek/OpenAI）
-- **交互方式**：3种（CLI/Web/飞书机器人）
-- **飞书集成**：需求分析结果自动写入飞书文档 + 飞书机器人对话交互
+- **交互方式**：4种（CLI/Web/飞书机器人/飞书链接独立脚本）
+- **飞书集成**：需求分析 + 测试点双文档自动写入 + 飞书机器人对话交互
+- **测试点产出**：四列对齐表格（飞书code块）+ 六字段JSON落盘，双链路统一
 
 ---
 
@@ -669,4 +711,4 @@ LLM调用成功 → 智能生成高质量代码
 
 ---
 
-**最后更新时间**：2026-08-12
+**最后更新时间**：2026-08-28
