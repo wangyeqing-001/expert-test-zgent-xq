@@ -40,8 +40,13 @@ ENV/
 memory_*.json
 memory_data/
 
-# Generated Tests
+# Generated Outputs (运行时产物，可由流水线重新生成)
 generated_tests/
+generated_requirements/
+generated_testpoints/
+
+# Temporary / Scratch Scripts
+_tmp_*.py
 
 # OS
 .DS_Store
