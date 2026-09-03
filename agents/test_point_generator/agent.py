@@ -331,24 +331,25 @@ class TestPointGenerator(BaseAgent):
         return batches
 
     def _publish_points(self, test_points: list, title: str) -> tuple:
-        """直提链路发布：子端分组 + 同端内分批 → 本地.md + JSON落盘(含batches) + 飞书(按端分节)
+        """直提链路发布：子端分组 + 同端内分批 → 本地.md + JSON落盘(含batches) + 飞书(按端分节原生表格)
         :return: (local_path, feishu_url, json_path, batches)
         """
         batches = self._split_into_batches(test_points)
         n_p0 = sum(1 for p in test_points if p['priority'] == 'P0')
-        # 飞书 struct：按端分节，每端一个 h2 + 四列表格
+        # 飞书 struct：按端分节，每端一个 h2 + 原生飞书表格
+        HEADERS = ['序号', '测试点详情', '优先级', '涉及端']
         struct_nodes = [
-            {'type': 'h1', 'text': '测试点清单'},
+            {'type': 'h1', 'text': f'{title} - 测试点清单'},
             {'type': 'paragraph', 'text': f'共{len(test_points)}个测试点（{len(batches)}批），其中P0 {n_p0}个。'},
         ]
         for b in batches:
-            rows = [[p['id'], p['endpoint'], p['detail'], p['priority']] for p in b['test_points']]
+            rows = [[i+1, p['detail'], p['priority'], p.get('endpoint', b['platform_label'])]
+                    for i, p in enumerate(b['test_points'])]
             struct_nodes.append({
                 'type': 'h2',
-                'text': f"{b['platform_label']} · 第{b['batch_index']}批（{len(b['test_points'])}个，{b['priority']}）"
+                'text': f"{b['platform_label']} · 第{b['batch_index']}批（{len(b['test_points'])}个，最高优先级{b['priority']}）"
             })
-            struct_nodes.append({'type': 'code', 'text': align_plain_table(
-                ['测试点ID', '涉及端', '测试点详情', '优先级'], rows)})
+            struct_nodes.append({'type': 'table', 'headers': HEADERS, 'rows': rows})
         md = struct_to_markdown(struct_nodes)
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -506,10 +507,8 @@ class TestPointGenerator(BaseAgent):
         if struct_nodes:
             # 先从table节点提取测试点JSON（供下游），再转对齐文本（顺序不可颠倒）
             test_points = self._extract_test_points(struct_nodes)
-            # 规整二维表 → 纯文本对齐表格（code块），规避Markdown/原生表格渲染风险
-            struct_nodes = self._tables_to_aligned_code(struct_nodes)
             md = struct_to_markdown(struct_nodes)
-            mode = 'LLM表格(纯文本对齐)'
+            mode = 'LLM表格(原生飞书表格)'
         else:
             print("  [测试点表格] LLM表格链路失败/未启用, 降级确定性渲染")
             struct_nodes = self._render_scenarios_struct(scenarios, title)
@@ -650,6 +649,8 @@ class TestPointGenerator(BaseAgent):
         return [
             {'type': 'h1', 'text': '测试点清单'},
             {'type': 'paragraph', 'text': f'共{len(scenarios)}个测试点，其中P0（高优先级）{n_high}个。'},
-            {'type': 'code', 'text': align_plain_table(
-                ['编号', '涉及端', '测试点详情', '优先级'], rows)}
+            {'type': 'table', 'headers': ['序号', '测试点详情', '优先级', '涉及端'],
+             'rows': [[i+1, f'{flat(s.get("function") or s.get("name", ""))} - {flat(s.get("description", ""))}' if flat(s.get("function") or s.get("name", "")) else flat(s.get("description", "")),
+                       _PRIORITY_P_MAP.get(s.get('priority', ''), flat(s.get('priority', ''))),
+                       '客户端'] for i, s in enumerate(scenarios)]}
         ]
