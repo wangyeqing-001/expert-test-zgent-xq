@@ -146,16 +146,25 @@ class RequirementAnalyzer(BaseAgent):
         # 清洗 + 拉取关联文档（qadoc 优先，已缓存 related_urls）
         content = self._clean_doc_content(content)
         related_urls = self.feishu_client.get_related_doc_urls(doc_token, doc_type, doc_url=doc_url)
-        content = self._extract_and_merge_related_docs(content, related_urls)
+        # 收集成功拉取的关联文档（标题+URL），用于最终飞书文档尾部追加索引
+        fetched_related = self._extract_and_merge_related_docs(content, related_urls)
+        # 从 merged 结果和原始 content 差异中提取关联文档索引
+        related_index = self._extract_related_index(content, related_urls)
 
-        markdown, blocks = self._analyze_prd_content(content)
+        markdown, blocks = self._analyze_prd_content(fetched_related)
+        # 在 markdown 尾部追加关联文档索引（LLM 分析已整合关联文档信息，索引提供原文回溯入口）
+        if related_index:
+            markdown = markdown.rstrip() + '\n\n' + self._build_related_index_md(related_index)
+            # blocks 末尾也追加关联文档索引节点
+            blocks = blocks + self._build_related_index_blocks(related_index)
         local_path, feishu_url = self._save_and_publish(markdown, doc_title, blocks)
 
         return {
             'markdown': markdown,
             'local_path': local_path,
             'feishu_url': feishu_url,
-            'raw_content': content,
+            'raw_content': fetched_related,
+            'related_docs': related_index,
         }
 
     # ==================== PRD 分析核心 ====================
@@ -355,6 +364,62 @@ class RequirementAnalyzer(BaseAgent):
 
         print(f"[RequirementAnalyzer] 共拉取 {fetched} 篇关联文档，已合并到主文档")
         return '\n'.join(merged_parts)
+
+    def _extract_related_index(self, content_before: str, related_urls: list) -> list:
+        """从 qadoc content 或 blocks API 提取关联文档的标题+URL 索引
+        :return: [{'title': str, 'url': str}, ...] 去重保序
+        """
+        if not related_urls:
+            return []
+        found = []
+        seen_urls = set()
+        # 1. 优先从 content 的 Markdown 链接 [标题](URL) 提取（qadoc content_text 内嵌）
+        url_set = set(related_urls)
+        md_link_pattern = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+feishu\.cn/(?:docx|wiki|sheets)/[a-zA-Z0-9]+)\)')
+        for match in md_link_pattern.finditer(content_before):
+            title, url = match.group(1).strip(), match.group(2).strip()
+            if url in url_set and url not in seen_urls:
+                seen_urls.add(url)
+                # 清洗 Markdown 转义残留（\| → |, \. → ., \& → &, &amp; → &）
+                title = re.sub(r'\\([|.`*_&])', r'\1', title)
+                title = title.replace('&amp;', '&')
+                found.append({'title': title, 'url': url})
+        # 2. 补充：content 里没匹配到的，尝试用 FeishuClient 拉标题
+        for url in related_urls:
+            if url in seen_urls:
+                continue
+            title = None
+            if self.feishu_client:
+                try:
+                    tk, dt = FeishuClient.parse_doc_url(url)
+                    title = self.feishu_client.get_doc_title(tk, dt)
+                except Exception:
+                    pass
+            found.append({'title': title or os.path.basename(url.rstrip('/')), 'url': url})
+            seen_urls.add(url)
+        return found
+
+    @staticmethod
+    def _build_related_index_md(related_index: list) -> str:
+        """构建关联文档索引 Markdown 段落（追加到 LLM 分析产出尾部）"""
+        lines = ['---', '', '## 关联文档索引', '', '以下文档在需求分析时已拉取并整合：', '']
+        for i, item in enumerate(related_index, 1):
+            lines.append(f'{i}. [{item["title"]}]({item["url"]})')
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _build_related_index_blocks(related_index: list) -> list:
+        """构建关联文档索引的 struct_blocks（用于飞书直写）"""
+        blocks = [
+            {'type': 'h1', 'text': '关联文档索引'},
+            {'type': 'paragraph', 'text': '以下文档在需求分析时已拉取并整合到分析结论中，点击标题可跳转原文：'},
+        ]
+        for item in related_index:
+            blocks.append({
+                'type': 'bullet_list',
+                'items': [f"[{item['title']}]({item['url']})"]
+            })
+        return blocks
 
     # ==================== 意图解析 ====================
 
