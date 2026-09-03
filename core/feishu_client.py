@@ -117,7 +117,9 @@ class FeishuClient:
         sub_ids = inner.get('sub_document_ids', '')
         related_urls = []
         if sub_ids:
-            related_urls = [u.strip() for u in sub_ids.split(',') if u.strip()]
+            # qadoc sub_document_ids 可能带反引号包裹: "`url1,url2`"
+            sub_ids = sub_ids.strip().strip('`').strip()
+            related_urls = [u.strip().strip('`').strip() for u in sub_ids.split(',') if u.strip()]
         return {'content': content, 'related_urls': related_urls, 'title': title}
 
     @retry(max_retries=3)

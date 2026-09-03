@@ -367,24 +367,43 @@ class RequirementAnalyzer(BaseAgent):
 
     def _extract_related_index(self, content_before: str, related_urls: list) -> list:
         """从 qadoc content 或 blocks API 提取关联文档的标题+URL 索引
+        qadoc content_text 里的飞书链接有两种格式：
+          - Markdown: [对齐文档](https://xueqiu.feishu.cn/docx/XXX)
+          - 反引号:   对齐文档：`https://xueqiu.feishu.cn/docx/XXX`
         :return: [{'title': str, 'url': str}, ...] 去重保序
         """
         if not related_urls:
             return []
         found = []
         seen_urls = set()
-        # 1. 优先从 content 的 Markdown 链接 [标题](URL) 提取（qadoc content_text 内嵌）
         url_set = set(related_urls)
+
+        # 1. Markdown 链接 [标题](URL)
         md_link_pattern = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+feishu\.cn/(?:docx|wiki|sheets)/[a-zA-Z0-9]+)\)')
         for match in md_link_pattern.finditer(content_before):
             title, url = match.group(1).strip(), match.group(2).strip()
             if url in url_set and url not in seen_urls:
                 seen_urls.add(url)
-                # 清洗 Markdown 转义残留（\| → |, \. → ., \& → &, &amp; → &）
-                title = re.sub(r'\\([|.`*_&])', r'\1', title)
-                title = title.replace('&amp;', '&')
+                title = re.sub(r'\\([|.`*_&])', r'\1', title).replace('&amp;', '&')
                 found.append({'title': title, 'url': url})
-        # 2. 补充：content 里没匹配到的，尝试用 FeishuClient 拉标题
+
+        # 2. 反引号格式 `URL`（qd adoc 常用，前面有描述文字如"对齐文档："）
+        backtick_url_pattern = re.compile(r'([^\s`：:，,;；]*?)\s*[：:]\s*`(https?://[^\s`]+feishu\.cn/(?:docx|wiki|sheets)/[a-zA-Z0-9]+)`')
+        for match in backtick_url_pattern.finditer(content_before):
+            label, url = match.group(1).strip(), match.group(2).strip()
+            if url in url_set and url not in seen_urls:
+                seen_urls.add(url)
+                found.append({'title': label or os.path.basename(url.rstrip('/')), 'url': url})
+
+        # 3. 纯反引号 URL（无前缀描述）
+        bare_backtick_pattern = re.compile(r'`(https?://[^\s`]+feishu\.cn/(?:docx|wiki|sheets)/[a-zA-Z0-9]+)`')
+        for match in bare_backtick_pattern.finditer(content_before):
+            url = match.group(1).strip()
+            if url in url_set and url not in seen_urls:
+                seen_urls.add(url)
+                found.append({'title': os.path.basename(url.rstrip('/')), 'url': url})
+
+        # 4. 补充：content 里都没匹配到的，用 FeishuClient 拉标题
         for url in related_urls:
             if url in seen_urls:
                 continue
