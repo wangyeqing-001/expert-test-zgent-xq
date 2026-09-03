@@ -261,6 +261,55 @@
         .examples li:hover {
             text-decoration: underline;
         }
+
+        /* 内嵌日志面板（页面内卡片，随文档流，不再浮层） */
+        .log-panel {
+            max-width: 1200px;
+            margin: 0 auto 30px;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.12);
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            color: #495057;
+        }
+        .log-panel.collapsed { height: 40px; }
+        .log-panel.expanded { height: 240px; }
+        .log-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 18px;
+            background: #f8f9fa;
+            cursor: pointer;
+            border-bottom: 1px solid #e9ecef;
+            user-select: none;
+            height: 40px;
+            box-sizing: border-box;
+        }
+        .log-header strong { color: #667eea; font-size: 13px; }
+        .log-actions { display: flex; gap: 8px; }
+        .log-actions button {
+            background: #e9ecef; color: #495057; border: none;
+            border-radius: 6px; padding: 3px 12px; font-size: 11px; cursor: pointer;
+        }
+        .log-actions button:hover { background: #dee2e6; }
+        .log-body {
+            overflow-y: auto;
+            padding: 10px 18px;
+            height: calc(100% - 40px);
+            line-height: 1.55;
+            white-space: pre-wrap;
+            word-break: break-all;
+            background: #fbfbfc;
+        }
+        .log-panel.collapsed .log-body { display: none; }
+        .log-line { padding: 1px 0; }
+        .log-line.error { color: #dc3545; }
+        .log-line.warning { color: #b7791f; }
+        .log-line.info { color: #495057; }
+        .log-line.debug { color: #0c5460; }
     </style>
 </head>
 <body>
@@ -413,6 +462,20 @@
         </div>
     </div>
 
+    <!-- 底部实时日志面板 -->
+    <div id="log-panel" class="log-panel collapsed">
+        <div class="log-header" onclick="toggleLogPanel()">
+            <strong>📡 实时日志</strong>
+            <div class="log-actions" onclick="event.stopPropagation()">
+                <button onclick="clearLogs()">清空</button>
+                <button id="log-pause-btn" onclick="togglePauseLogs()">暂停</button>
+                <button id="log-autoscroll-btn" onclick="toggleAutoScroll()">自动滚动: 开</button>
+                <button onclick="toggleLogPanel()">折叠/展开</button>
+            </div>
+        </div>
+        <div class="log-body" id="log-body"></div>
+    </div>
+
     <script>
         // 切换标签页
         function switchTab(tab, el) {
@@ -427,12 +490,26 @@
             document.getElementById(fieldId).value = text;
         }
 
-        // 显示加载状态
+        // 全局处理锁：分析/生成期间禁用所有操作按钮（日志面板按钮除外，便于观察）
+        let isProcessing = false;
+        function setProcessing(state) {
+            isProcessing = state;
+            document.querySelectorAll('button').forEach(b => {
+                if (b.closest('#log-panel')) return;
+                b.disabled = state;
+                b.style.opacity = state ? '0.55' : '';
+                b.style.cursor = state ? 'not-allowed' : '';
+            });
+        }
+
+        // 显示加载状态（并锁定全页操作按钮）
+        // 注意：只替换 content 子元素内容，保留 result-header 和 badge，避免后续渲染时getElementById取不到元素
         function showLoading(btnId, resultId) {
-            document.getElementById(btnId).disabled = true;
+            setProcessing(true);
             const resultDiv = document.getElementById(resultId);
             resultDiv.style.display = 'block';
-            resultDiv.innerHTML = `
+            const contentDiv = resultDiv.querySelector('div[id$="-content"]') || resultDiv;
+            contentDiv.innerHTML = `
                 <div class="loading">
                     <div class="spinner"></div>
                     <p>AI正在思考中...</p>
@@ -440,13 +517,22 @@
             `;
         }
 
-        // 隐藏加载状态
-        function hideLoading(btnId) {
-            document.getElementById(btnId).disabled = false;
+        // 隐藏加载状态（移除spinner + 解锁全页操作按钮）
+        // 注意：只移除 .loading 元素，不隐藏整个 result-section，保留结构和可见性供后续渲染
+        function hideLoading(btnId, resultId) {
+            setProcessing(false);
+            if (resultId) {
+                const resultDiv = document.getElementById(resultId);
+                if (resultDiv) {
+                    const loading = resultDiv.querySelector('.loading');
+                    if (loading) loading.remove();
+                }
+            }
         }
 
         // 需求分析
         async function analyzeRequirement() {
+            if (isProcessing) return;
             const query = document.getElementById('req-query').value.trim();
             if (!query) {
                 alert('请输入查询内容');
@@ -456,14 +542,15 @@
             showLoading('req-btn', 'req-result');
 
             try {
+                const docTitle = document.getElementById('req-query').dataset.docTitle || '';
                 const response = await fetch('/api/requirement', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query})
+                    body: JSON.stringify({query, doc_title: docTitle})
                 });
 
                 const data = await response.json();
-                hideLoading('req-btn');
+                hideLoading('req-btn', 'req-result');
 
                 if (data.success) {
                     displayRequirementResult(data);
@@ -471,7 +558,7 @@
                     showError('req-result', data.error);
                 }
             } catch (error) {
-                hideLoading('req-btn');
+                hideLoading('req-btn', 'req-result');
                 showError('req-result', '网络错误: ' + error.message);
             }
         }
@@ -480,26 +567,35 @@
         function displayRequirementResult(data) {
             const badge = document.getElementById('req-badge');
             badge.className = 'badge badge-success';
-            badge.textContent = `✓ ${data.test_scenarios.length} 个场景`;
+            badge.textContent = '✓ 分析完成';
 
-            let html = '<ul class="scenarios-list">';
-            data.test_scenarios.forEach(scenario => {
-                const priorityClass = `priority-${scenario.priority}`;
-                html += `
-                    <li class="scenario-item">
-                        <span class="scenario-priority ${priorityClass}">${scenario.priority}</span>
-                        <strong>${scenario.description}</strong>
-                        <br><small style="color:#6c757d">测试点: ${scenario.test_points.join(', ')}</small>
-                    </li>
-                `;
-            });
-            html += '</ul>';
+            let html = '';
+            if (data.feishu_url) {
+                html += `<p style="margin-bottom:10px"><strong>📄 飞书文档:</strong> <a href="${data.feishu_url}" target="_blank" style="color:#667eea;word-break:break-all">${data.feishu_url}</a></p>`;
+            } else {
+                html += `<p style="margin-bottom:10px;color:#6c757d"><strong>📄 飞书文档:</strong> 未生成（未配置FEISHU_OUTPUT_FOLDER/FEISHU_DOMAIN，或写入失败）</p>`;
+            }
+            if (data.local_path) {
+                html += `<p style="margin-bottom:10px"><strong>💾 本地文件:</strong> <code style="background:#e9ecef;padding:2px 6px;border-radius:4px;word-break:break-all">${data.local_path}</code></p>`;
+            }
+            const md = data.metadata || {};
+            const metaParts = [];
+            if (md.source) metaParts.push('来源=' + md.source);
+            if (md.title) metaParts.push('标题=' + md.title);
+            if (metaParts.length) {
+                html += `<p style="margin-bottom:10px;color:#6c757d;font-size:13px"><strong>元数据:</strong> ${metaParts.join(' · ')}</p>`;
+            }
+            if (data.markdown) {
+                const preview = data.markdown.length > 2000 ? data.markdown.slice(0, 2000) + '\n...(已截断，完整内容见飞书文档/本地文件)' : data.markdown;
+                html += `<details><summary style="cursor:pointer;color:#495057;font-weight:600">查看需求分析预览</summary><pre class="code-block" style="max-height:320px;margin-top:10px"><code>${escapeHtml(preview)}</code></pre></details>`;
+            }
 
             document.getElementById('req-content').innerHTML = html;
         }
 
         // 生成测试点
         async function generateTestPoints() {
+            if (isProcessing) return;
             const query = document.getElementById('tp-query').value.trim();
             if (!query) { alert('请输入查询内容'); return; }
 
@@ -512,7 +608,7 @@
                     body: JSON.stringify({query})
                 });
                 const data = await response.json();
-                hideLoading('tp-btn');
+                hideLoading('tp-btn', 'tp-result');
 
                 if (data.success) {
                     const badge = document.getElementById('tp-badge');
@@ -534,13 +630,14 @@
                     showError('tp-result', data.error);
                 }
             } catch (error) {
-                hideLoading('tp-btn');
+                hideLoading('tp-btn', 'tp-result');
                 showError('tp-result', '网络错误: ' + error.message);
             }
         }
 
         // 生成测试
         async function generateTest() {
+            if (isProcessing) return;
             const doc = document.getElementById('gen-doc').value.trim();
             const query = document.getElementById('gen-query').value.trim();
             
@@ -562,7 +659,7 @@
                 });
 
                 const data = await response.json();
-                hideLoading('gen-btn');
+                hideLoading('gen-btn', 'gen-result');
 
                 if (data.success) {
                     displayGenerateResult(data);
@@ -570,7 +667,7 @@
                     showError('gen-result', data.error);
                 }
             } catch (error) {
-                hideLoading('gen-btn');
+                hideLoading('gen-btn', 'gen-result');
                 showError('gen-result', '网络错误: ' + error.message);
             }
         }
@@ -672,11 +769,15 @@
                 btn.textContent = '导入';
 
                 if (data.success) {
-                    // 将PRD文档内容直接填充到查询框
+                    // 将PRD文档内容直接填充到查询框，并记住原文档标题（供生成文档命名）
                     const content = data.content;
-                    document.getElementById('req-query').value = `根据以下需求文档分析测试需求：\n\n${content}`;
-                    
-                    showImportNotice('feishu-url-req', `✓ 成功导入飞书${data.doc_type === 'doc' ? '文档' : data.doc_type === 'wiki' ? '知识库' : '表格'} (${content.length} 字符)`);
+                    const reqQuery = document.getElementById('req-query');
+                    reqQuery.value = `根据以下需求文档分析测试需求：\n\n${content}`;
+                    reqQuery.dataset.docTitle = data.title || '';
+
+                    const typeLabel = data.doc_type === 'doc' ? '文档' : data.doc_type === 'wiki' ? '知识库' : '表格';
+                    const titlePart = data.title ? `《${data.title}》` : '';
+                    showImportNotice('feishu-url-req', `✓ 成功导入飞书${typeLabel} ${titlePart} (${content.length} 字符)`);
                 } else {
                     alert('导入失败: ' + data.error);
                 }
@@ -747,6 +848,85 @@
             if (e.ctrlKey && e.key === 'Enter') {
                 generateTestPoints();
             }
+        });
+
+        // ===== 底部实时日志面板 =====
+        let logSince = 0;
+        let logPaused = false;
+        let logAutoScroll = true;
+        let logTimer = null;
+
+        function logLevelClass(text) {
+            if (/\bERROR\b/.test(text)) return 'error';
+            if (/\bWARNING\b/.test(text)) return 'warning';
+            if (/\bDEBUG\b/.test(text)) return 'debug';
+            return 'info';
+        }
+
+        function appendLogLine(text) {
+            const body = document.getElementById('log-body');
+            const line = document.createElement('div');
+            line.className = 'log-line ' + logLevelClass(text);
+            line.textContent = text;
+            body.appendChild(line);
+            while (body.childNodes.length > 1000) body.removeChild(body.firstChild);
+            if (logAutoScroll) body.scrollTop = body.scrollHeight;
+        }
+
+        async function pollLogs() {
+            try {
+                const r = await fetch('/api/logs?since=' + logSince);
+                const d = await r.json();
+                if (d.logs && d.logs.length) {
+                    d.logs.forEach(l => appendLogLine(l.text));
+                }
+                if (d.latest != null) logSince = d.latest;
+            } catch (e) { /* 静默，下次重试 */ }
+        }
+
+        function startLogPolling() {
+            if (logTimer) return;
+            pollLogs();
+            logTimer = setInterval(pollLogs, 1500);
+        }
+
+        function toggleLogPanel() {
+            const p = document.getElementById('log-panel');
+            const expanded = p.classList.toggle('expanded');
+            p.classList.toggle('collapsed', !expanded);
+            if (expanded) {
+                startLogPolling();
+                const body = document.getElementById('log-body');
+                body.scrollTop = body.scrollHeight;
+            }
+        }
+
+        function clearLogs() {
+            document.getElementById('log-body').innerHTML = '';
+        }
+
+        function togglePauseLogs() {
+            logPaused = !logPaused;
+            document.getElementById('log-pause-btn').textContent = logPaused ? '继续' : '暂停';
+            if (logPaused) { clearInterval(logTimer); logTimer = null; }
+            else startLogPolling();
+        }
+
+        function toggleAutoScroll() {
+            logAutoScroll = !logAutoScroll;
+            document.getElementById('log-autoscroll-btn').textContent = '自动滚动: ' + (logAutoScroll ? '开' : '关');
+            if (logAutoScroll) {
+                const body = document.getElementById('log-body');
+                body.scrollTop = body.scrollHeight;
+            }
+        }
+
+        // 页面加载后默认展开日志面板并开始拉取
+        document.addEventListener('DOMContentLoaded', function() {
+            const p = document.getElementById('log-panel');
+            p.classList.add('expanded');
+            p.classList.remove('collapsed');
+            startLogPolling();
         });
     </script>
 </body>

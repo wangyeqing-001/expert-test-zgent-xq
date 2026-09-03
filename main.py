@@ -1,7 +1,7 @@
 """多Agent协作 - 客户端测试用例生成系统"""
 import os
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 from core.llm_client import LLMClient
 from core.feishu_client import FeishuClient

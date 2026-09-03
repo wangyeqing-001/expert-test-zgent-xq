@@ -92,7 +92,7 @@ class RequirementAnalyzer(BaseAgent):
         
         # PRD文档内容：直接分析文本
         if not parsed.get('file_path') and (parsed.get('is_prd') or len(query) > 200):
-            doc_title = title or parsed.get('title') or '需求分析-PRD文档'
+            doc_title = title or parsed.get('title') or 'PRD文档'
             raw = self._clean_doc_content(query)
             markdown, blocks = self._analyze_prd_content(raw)
             local_path, feishu_url = self._save_and_publish(markdown, doc_title, blocks)
@@ -113,8 +113,9 @@ class RequirementAnalyzer(BaseAgent):
         })
     
     def _extract_feishu_url(self, query: str) -> str:
-        """从查询中提取飞书文档链接"""
-        m = re.search(r'https?://[\w.-]*feishu\.cn/\S+', query)
+        """从查询中提取飞书文档链接。仅当查询本身以飞书文档直链(docx/wiki/sheets)开头时才提取，
+        避免误把PRD正文里引用的 /share/base/form/ 等非文档链接当成待分析文档去拉取。"""
+        m = re.match(r'https?://[\w.-]*feishu\.cn/(?:docx|wiki|sheets)/[a-zA-Z0-9]+', query.strip())
         return m.group(0) if m else ''
     
     # 图片文件名行（如 image.png / img_v3_xxx.jpg）
@@ -171,7 +172,7 @@ class RequirementAnalyzer(BaseAgent):
         
         print(f"  [process_query] 检测到飞书文档链接: {doc_url}")
         doc_token, doc_type = FeishuClient.parse_doc_url(doc_url)
-        doc_title = title or self.feishu_client.get_doc_title(doc_token, doc_type) or '需求分析-飞书文档'
+        doc_title = title or self.feishu_client.get_doc_title(doc_token, doc_type) or '飞书文档'
         content = self.feishu_client.get_doc_content(doc_token, doc_type)
         if not content or not content.strip():
             raise ValueError(f"飞书文档内容为空，请检查文档权限: {doc_url}")
@@ -371,14 +372,14 @@ class RequirementAnalyzer(BaseAgent):
         if struct_blocks:
             try:
                 return self.feishu_client.create_doc_from_struct(
-                    title=f"[需求分析] {title}",
+                    title=f"{title}-需求分析",
                     folder_token=self.feishu_folder,
                     struct_blocks=struct_blocks
                 )
             except Exception as e:
                 print(f"  [_publish_feishu] struct直写失败, 降级Markdown链路: {type(e).__name__}: {str(e)[:150]}")
         return self.feishu_client.create_doc(
-            title=f"[需求分析] {title}",
+            title=f"{title}-需求分析",
             folder_token=self.feishu_folder,
             content=markdown
         )

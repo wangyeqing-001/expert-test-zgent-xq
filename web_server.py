@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import threading
+from collections import deque
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from agents.requirement_analyzer import RequirementAnalyzer
@@ -18,12 +19,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---- 实时日志缓冲（供前端 /api/logs 增量拉取，展示在页面底部）----
+_log_buffer = deque(maxlen=500)
+_log_seq = 0
+_log_lock = threading.Lock()
+
+
+class _BufferLogHandler(logging.Handler):
+    """把日志同步写入内存缓冲，前端轮询展示。"""
+    def emit(self, record):
+        global _log_seq
+        try:
+            text = self.format(record)
+            with _log_lock:
+                _log_seq += 1
+                _log_buffer.append((_log_seq, text))
+        except Exception:
+            pass
+
+
+_buf_handler = _BufferLogHandler()
+_buf_handler.setLevel(logging.INFO)
+_buf_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(name)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S'
+))
+logging.getLogger().addHandler(_buf_handler)
+# 降低 werkzeug 请求日志级别，避免轮询刷屏
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
 app = Flask(__name__, static_folder='web', static_url_path='')
 CORS(app)
 
 # 初始化Agent（全局单例）
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 # 优先使用百炼,降级到DeepSeek/OpenAI
 from core.llm_client import LLMClient
@@ -74,12 +103,13 @@ def analyze_requirement():
     try:
         data = request.json
         query = data.get('query', '')
-        
+        doc_title = data.get('doc_title')  # 飞书导入时携带的原文档标题
+
         if not query:
             return jsonify({'error': '查询内容不能为空'}), 400
-        
+
         with _agent_lock:
-            result = req_agent.process_query(query)
+            result = req_agent.process_query(query, title=doc_title)
         
         return jsonify({
             'success': True,
@@ -177,6 +207,22 @@ def get_status():
         'requirement_agent': req_agent.get_state(),
         'test_point_agent': point_agent.get_state(),
         'generator_agent': gen_agent.get_state()
+    })
+
+
+@app.route('/api/logs')
+def get_logs():
+    """前端底部日志面板拉取增量日志（?since=<seq>）"""
+    try:
+        since = int(request.args.get('since', '0'))
+    except ValueError:
+        since = 0
+    with _log_lock:
+        items = [(s, t) for s, t in _log_buffer if s > since]
+        latest = _log_seq
+    return jsonify({
+        'logs': [{'seq': s, 'text': t} for s, t in items],
+        'latest': latest
     })
 
 
@@ -332,13 +378,20 @@ def parse_feishu_doc():
         
         content = feishu_client.get_doc_content(doc_token, doc_type)
         content_len = len(content) if content else 0
-        logger.info(f"成功获取文档内容: 长度={content_len}字符")
-        
+        # 获取文档原标题（供前端拼接生成文档命名，避免标题泛化）
+        try:
+            doc_title = feishu_client.get_doc_title(doc_token, doc_type)
+        except Exception as e:
+            logger.warning(f"获取文档标题失败: {e}")
+            doc_title = ''
+        logger.info(f"成功获取文档内容: 长度={content_len}字符, 标题={doc_title}")
+
         return jsonify({
             'success': True,
             'content': content,
             'doc_type': doc_type,
-            'doc_token': doc_token
+            'doc_token': doc_token,
+            'title': doc_title
         })
     
     except ValueError as e:
@@ -389,4 +442,4 @@ if __name__ == '__main__':
     print(f"日志级别: INFO")
     print("="*50)
     logger.info(f"Web服务启动, 端口={args.port}")
-    app.run(host='0.0.0.0', port=args.port, debug=True)
+    app.run(host='0.0.0.0', port=args.port, debug=True, threaded=True, use_reloader=False)

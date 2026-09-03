@@ -10,7 +10,7 @@ for root, dirs, files in os.walk('.'):
         shutil.rmtree(os.path.join(root, '__pycache__'))
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 from agents.requirement_analyzer import RequirementAnalyzer
 from agents.test_point_generator import TestPointGenerator
