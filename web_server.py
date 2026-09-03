@@ -439,7 +439,7 @@ def parse_feishu_doc():
         doc_token, doc_type = FeishuClient.parse_doc_url(doc_url)
         logger.info(f"URL解析成功: token={doc_token}, type={doc_type}")
         
-        content = feishu_client.get_doc_content(doc_token, doc_type)
+        content = feishu_client.get_doc_content(doc_token, doc_type, doc_url=doc_url)
         content_len = len(content) if content else 0
         # 获取文档原标题（供前端拼接生成文档命名，避免标题泛化）
         try:

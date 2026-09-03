@@ -57,7 +57,7 @@ def run(feishu_url: str):
     title = feishu.get_doc_title(token, doc_type)
     print(f"  标题: {title or '(未获取到)'}")
 
-    content = feishu.get_doc_content(token, doc_type)
+    content = feishu.get_doc_content(token, doc_type, doc_url=feishu_url)
     print(f"  文档内容: {len(content)} 字符")
     print(f"  耗时: {time.time()-t1:.2f}s")
 

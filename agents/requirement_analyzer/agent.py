@@ -338,7 +338,7 @@ class RequirementAnalyzer(BaseAgent):
             try:
                 doc_token, doc_type = FeishuClient.parse_doc_url(url)
                 title = self.feishu_client.get_doc_title(doc_token, doc_type) or '未命名文档'
-                doc_content = self.feishu_client.get_doc_content(doc_token, doc_type)
+                doc_content = self.feishu_client.get_doc_content(doc_token, doc_type, doc_url=url)
 
                 if not doc_content or not doc_content.strip():
                     print(f"[RequirementAnalyzer] 关联文档内容为空，跳过: {url}")
