@@ -82,32 +82,36 @@ class TestPointGenerator(BaseAgent):
             # structured_constraints: None=自动跑分支A提取；显式传入则直接使用
             structured_constraints = input_data.get('structured_constraints')
             test_points = self._extract_testpoints_from_prd(prd_text, structured_constraints)
+            batches = []
             if test_points:
-                local_path, feishu_url, json_path = self._publish_points(test_points, doc_title)
-                scenarios = self._points_to_scenarios(test_points)  # 下游兼容
+                local_path, feishu_url, json_path, batches = self._publish_points(test_points, doc_title)
+                scenarios = self._points_to_scenarios(test_points)  # 下游兼容（旧路径）
             else:
                 print("  [测试点] prd直提失败, 降级规则生成 + 阶段2表格链路")
                 scenarios = self._generate_by_rules(requirements)
                 local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title)
         else:
+            batches = []
             scenarios = self._generate_from_code_requirements(requirements, test_type)
             # 表格产出：本地.md + 飞书文档（列结构由testpoints_table.md指定）
             # 同时提取测试点JSON落盘，供下游用例生成（分批送入大模型）使用
             local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title)
-        
+
         self.state = {
             'scenario_count': len(scenarios),
             'test_point_count': len(test_points),
+            'batch_count': len(batches),
             'source': source,
             'test_type': test_type,
             'local_path': local_path,
             'json_path': json_path,
             'feishu_url': feishu_url
         }
-        
+
         return {
             'scenarios': scenarios,
             'test_points': test_points,
+            'batches': batches,  # 新：子端分组+分批，供下游按端路由prompt
             'test_points_json_path': json_path,
             'local_path': local_path,
             'feishu_url': feishu_url,
@@ -184,15 +188,31 @@ class TestPointGenerator(BaseAgent):
         # 降级方案：规则生成
         return self._generate_by_rules(requirements)
     
-    # ---------- prd直提链路（端分组JSON → 四列测试点，跳过scenarios中间层） ----------
+    # ---------- prd直提链路（端分组JSON → 子端分组 + 同端内分批 TestBatch） ----------
     
-    # 端分组键路径 → 涉及端（本系统聚焦客户端测试，不提取后端/管理后台测试点）
-    _GROUP_ENDPOINT_MAP = [
+    # platform → (label, max_per_batch, prompt文件, framework, assertion_focus)
+    # 端维度决定下游 TestGenerator 用哪套 prompt/框架；批次维度控制单次生成数量
+    _PLATFORM_CONFIG = {
+        'app':     ('客户端-App',  8,  'app_test.md',     'Appium',              '页面元素/交互流程/视觉状态'),
+        'web':     ('客户端-Web',  8,  'web_test.md',     'Playwright',          '页面导航/元素定位/显式等待'),
+        'h5':      ('客户端-H5',   8,  'h5_test.md',      'Playwright',          'WebView兼容/页面适配/交互'),
+        'common':  ('客户端-通用', 8,  'common_test.md',  'Playwright/Appium',   'UI交互/状态反馈/兼容性'),
+        'backend': ('后端服务',    12, 'backend_test.md', 'requests+pytest',     '接口返回码/数据字段/数据库状态'),
+        'admin':   ('管理后台',    10, 'admin_test.md',   'Playwright',          '页面功能/权限控制/表单校验'),
+        'e2e':     ('端到端集成',   6,  'e2e_test.md',     'Playwright+requests', '跨端流程/数据流转/状态同步'),
+    }
+    # 端分组JSON路径 → platform（扩展现状：新增 backend/admin/e2e 提取）
+    _GROUP_PLATFORM_MAP = [
         (('client', 'app'), 'app'),
         (('client', 'web'), 'web'),
-        (('client', 'h5'), 'h5'),
-        (('client', 'common'), '客户端'),
+        (('client', 'h5'),  'h5'),
+        (('client', 'common'), 'common'),
+        (('backend',),          'backend'),
+        (('operation_backend',), 'admin'),   # prompt键保留 operation_backend，代码层映射 admin
+        (('e2e',),              'e2e'),
     ]
+    # 兼容别名（旧名指向新语义：元素为 (path, platform)）
+    _GROUP_ENDPOINT_MAP = _GROUP_PLATFORM_MAP
     
     # 合法测试点类型（供下游分批）
     _VALID_TYPES = {'normal', 'edge_case', 'error_handling'}
@@ -228,18 +248,20 @@ class TestPointGenerator(BaseAgent):
             if not isinstance(grouped, dict):
                 return []
             points = []
-            for path, endpoint in self._GROUP_ENDPOINT_MAP:
+            for path, platform in self._GROUP_PLATFORM_MAP:
                 node = grouped
                 for k in path:
                     node = node.get(k) if isinstance(node, dict) else None
                 if not isinstance(node, list):
                     continue
+                label = self._PLATFORM_CONFIG[platform][0]  # 涉及端中文标签
                 for item in node:
                     if isinstance(item, dict) and str(item.get('detail', '')).strip():
                         t = str(item.get('type', 'normal')).strip().lower()
                         points.append({
                             'id': '',
-                            'endpoint': endpoint,
+                            'endpoint': label,    # 涉及端（中文，飞书表格展示用）
+                            'platform': platform,  # 英文键，供下游 TestGenerator 路由 prompt
                             'detail': re.sub(r'[\r\n]+', ' ', str(item['detail'])).strip()[:120],
                             'priority': str(item.get('priority', 'P1')).strip().upper(),
                             'source': 'prd',  # 来源标识，供下游追溯
@@ -274,33 +296,75 @@ class TestPointGenerator(BaseAgent):
                 print(f"⚠ [TestPointGenerator] 端分组JSON解析失败: {str(e)[:80]}")
                 return None
     
-    def _publish_points(self, test_points: list, title: str) -> tuple:
-        """直提链路发布：确定性对齐表格（不再调二次LLM）→ 本地.md + JSON落盘 + 飞书
-        :return: (local_path, feishu_url, json_path)
+    def _split_into_batches(self, test_points: list) -> list:
+        """按 platform 分组 + 同端内按 max_per_batch 切批 → List[TestBatch]
+        每批注入该端 shared_context（静态），batch_index 在端内连续，priority 取批内最高
         """
-        rows = [[p['id'], p['endpoint'], p['detail'], p['priority']] for p in test_points]
+        by_platform = {}
+        for p in test_points:
+            by_platform.setdefault(p.get('platform', 'common'), []).append(p)
+        priority_rank = {'P0': 0, 'P1': 1, 'P2': 2}
+        batches = []
+        for platform, cfg in self._PLATFORM_CONFIG.items():
+            pts = by_platform.get(platform, [])
+            if not pts:
+                continue
+            label, max_per_batch, _prompt_file, framework, assertion_focus = cfg
+            pts_sorted = sorted(pts, key=lambda x: priority_rank.get(x.get('priority', 'P1'), 1))
+            for idx in range(0, len(pts_sorted), max_per_batch):
+                chunk = pts_sorted[idx:idx + max_per_batch]
+                batch_priority = min(
+                    (p.get('priority', 'P1') for p in chunk),
+                    key=lambda pr: priority_rank.get(pr, 1))
+                batches.append({
+                    'platform': platform,
+                    'platform_label': label,
+                    'batch_index': idx // max_per_batch + 1,
+                    'priority': batch_priority,
+                    'shared_context': {
+                        'framework': framework,
+                        'assertion_focus': assertion_focus,
+                    },
+                    'test_points': chunk,
+                    'depends_on': [],  # 预留：批次间依赖，首期留空
+                })
+        return batches
+
+    def _publish_points(self, test_points: list, title: str) -> tuple:
+        """直提链路发布：子端分组 + 同端内分批 → 本地.md + JSON落盘(含batches) + 飞书(按端分节)
+        :return: (local_path, feishu_url, json_path, batches)
+        """
+        batches = self._split_into_batches(test_points)
         n_p0 = sum(1 for p in test_points if p['priority'] == 'P0')
+        # 飞书 struct：按端分节，每端一个 h2 + 四列表格
         struct_nodes = [
             {'type': 'h1', 'text': '测试点清单'},
-            {'type': 'paragraph', 'text': f'共{len(test_points)}个测试点，其中P0 {n_p0}个。'},
-            {'type': 'code', 'text': align_plain_table(
-                ['测试点ID', '涉及端', '测试点详情', '优先级'], rows)}
+            {'type': 'paragraph', 'text': f'共{len(test_points)}个测试点（{len(batches)}批），其中P0 {n_p0}个。'},
         ]
+        for b in batches:
+            rows = [[p['id'], p['endpoint'], p['detail'], p['priority']] for p in b['test_points']]
+            struct_nodes.append({
+                'type': 'h2',
+                'text': f"{b['platform_label']} · 第{b['batch_index']}批（{len(b['test_points'])}个，{b['priority']}）"
+            })
+            struct_nodes.append({'type': 'code', 'text': align_plain_table(
+                ['测试点ID', '涉及端', '测试点详情', '优先级'], rows)})
         md = struct_to_markdown(struct_nodes)
-        
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_title = re.sub(r'[^\w\u4e00-\u9fff-]', '_', title)[:50]
         local_path = os.path.join(self.output_dir, f"{safe_title}_{timestamp}.md")
         with open(local_path, 'w', encoding='utf-8') as f:
             f.write(md)
         print(f"✓ [TestPointGenerator] 测试点表格本地保存: {local_path}")
-        
+
         json_path = os.path.join(self.output_dir, f"{safe_title}_{timestamp}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump({'title': title, 'total': len(test_points), 'test_points': test_points},
+            json.dump({'title': title, 'total': len(test_points), 'batches': batches,
+                       'test_points': test_points},  # 扁平列表保留，向后兼容
                       f, ensure_ascii=False, indent=2)
-        print(f"✓ [TestPointGenerator] 测试点JSON保存({len(test_points)}条): {json_path}")
-        
+        print(f"✓ [TestPointGenerator] 测试点JSON保存({len(test_points)}条/{len(batches)}批): {json_path}")
+
         feishu_url = None
         if self.feishu_client and self.feishu_folder:
             try:
@@ -313,15 +377,16 @@ class TestPointGenerator(BaseAgent):
                 print(f"  [测试点] 飞书文档创建成功: {feishu_url}")
             except Exception as e:
                 print(f"  [测试点] 飞书文档创建失败: {type(e).__name__}: {str(e)[:200]}")
-        
-        return local_path, feishu_url, json_path
+
+        return local_path, feishu_url, json_path, batches
     
     @staticmethod
     def _points_to_scenarios(test_points: list) -> list:
         """测试点 → 兼容下游orchestrator Step3的scenario结构"""
         p_map = {'P0': 'high', 'P1': 'medium', 'P2': 'low'}
         return [{
-            'function': p['endpoint'],
+            'function': p.get('platform', p['endpoint']),  # 用英文 platform 键作 function（适合文件名）
+            'platform': p.get('platform', 'common'),       # 透传，供下游路由
             'scenario': p.get('type', 'normal'),
             'description': p['detail'],
             'priority': p_map.get(p['priority'], 'medium'),

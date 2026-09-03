@@ -9,12 +9,12 @@
 {test_points_list}
 
 要求:
-1. 使用 Playwright 框架（Python版，sync API）
-2. 包含页面导航、元素定位（selector/role/label）、交互操作（click/fill/select）
-3. 用显式等待（expect/page.wait_for），避免硬性 sleep
-4. 采用 Page Object 模式组织页面操作
+1. 使用 requests/httpx 发送 HTTP 请求，用 pytest 组织用例
+2. 验证响应状态码、响应体字段、响应头
+3. 使用 pytest fixture 复用鉴权/数据库种子，参数化测试边界值
+4. 覆盖超时、重试、错误处理
 5. 每个测试点生成一个独立测试函数 test_<id>_<简述>
-6. 包含断言（元素可见性/文本/状态）和异常处理
+6. 包含断言和异常处理
 7. 添加必要注释
 
 只返回Python测试代码，无解释。

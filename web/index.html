@@ -173,6 +173,23 @@
             border-left: 4px solid #667eea;
         }
 
+        .history-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .history-item {
+            padding: 12px 14px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #28a745;
+        }
+        .history-link {
+            color: #667eea;
+            word-break: break-all;
+        }
+
         .scenario-priority {
             display: inline-block;
             padding: 2px 8px;
@@ -377,6 +394,17 @@
                     </div>
                     <div id="req-content"></div>
                 </div>
+
+                <!-- 历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接 -->
+                <div id="req-history" class="result-section" style="margin-top:20px">
+                    <div class="result-header">
+                        <h3>📜 历史记录</h3>
+                        <button class="btn" style="padding:4px 12px;font-size:13px" onclick="loadHistory()">刷新</button>
+                    </div>
+                    <div id="req-history-content">
+                        <p style="color:#6c757d;padding:10px">加载中...</p>
+                    </div>
+                </div>
             </div>
 
             <!-- 测试点生成面板 -->
@@ -554,6 +582,7 @@
 
                 if (data.success) {
                     displayRequirementResult(data);
+                    loadHistory();  // 刷新历史记录
                 } else {
                     showError('req-result', data.error);
                 }
@@ -591,6 +620,43 @@
             }
 
             document.getElementById('req-content').innerHTML = html;
+        }
+
+        // 加载需求分析历史记录（原始需求文档链接 + 生成的需求分析飞书文档链接，可点击打开）
+        async function loadHistory() {
+            try {
+                const resp = await fetch('/api/history');
+                const data = await resp.json();
+                const box = document.getElementById('req-history-content');
+                if (!data.items || !data.items.length) {
+                    box.innerHTML = '<p style="color:#6c757d;padding:10px">暂无历史记录</p>';
+                    return;
+                }
+                let html = '<ul class="history-list">';
+                data.items.forEach(it => {
+                    const time = it.created_at || '';
+                    const src = it.source_doc_url
+                        ? `<a href="${it.source_doc_url}" target="_blank" class="history-link">原始需求文档</a>`
+                        : '<span style="color:#6c757d">文本/代码输入</span>';
+                    const gen = it.feishu_url
+                        ? `<a href="${it.feishu_url}" target="_blank" class="history-link">需求分析文档</a>`
+                        : '<span style="color:#dc3545">未生成</span>';
+                    html += `<li class="history-item">
+                        <div style="display:flex;justify-content:space-between;align-items:center">
+                            <strong>${escapeHtml(it.source_title || '未命名')}</strong>
+                            <small style="color:#6c757d">${time}</small>
+                        </div>
+                        <div style="margin-top:6px;font-size:13px">
+                            <span style="margin-right:20px">📄 来源: ${src}</span>
+                            <span>✨ 生成: ${gen}</span>
+                        </div>
+                    </li>`;
+                });
+                html += '</ul>';
+                box.innerHTML = html;
+            } catch (e) {
+                document.getElementById('req-history-content').innerHTML = '<p style="color:#dc3545;padding:10px">历史记录加载失败</p>';
+            }
         }
 
         // 生成测试点
@@ -927,6 +993,7 @@
             p.classList.add('expanded');
             p.classList.remove('collapsed');
             startLogPolling();
+            loadHistory();  // 加载需求分析历史记录
         });
     </script>
 </body>

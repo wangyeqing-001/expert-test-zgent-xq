@@ -9,6 +9,13 @@ from core.tools import create_default_tools
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
+# platform → 该端 prompt 文件（与 test_point_generator._PLATFORM_CONFIG 对齐）
+_PROMPT_REGISTRY = {
+    'app': 'app_test.md', 'web': 'web_test.md', 'h5': 'h5_test.md',
+    'common': 'common_test.md', 'backend': 'backend_test.md',
+    'admin': 'admin_test.md', 'e2e': 'e2e_test.md',
+}
+
 
 class TestGeneratorAgent(BaseAgent):
     """测试生成Agent：根据需求文档生成测试代码"""
@@ -264,6 +271,42 @@ class TestGeneratorAgent(BaseAgent):
             test_points=test_points_str,
             priority=scenario.get('priority', 'medium'),
             description=scenario['description'])
+
+    def execute_batch(self, batch: dict) -> dict:
+        """按端 TestBatch 生成测试代码（platform 路由到该端专用 prompt）
+        :param batch: {platform, platform_label, batch_index, shared_context, test_points, priority}
+        :return: {'file_path': str, 'platform': str, 'batch_index': int}
+        """
+        platform = batch.get('platform', 'common')
+        sc = batch.get('shared_context') or {}
+        # 测试点列表文本：id + detail + type + priority
+        lines = []
+        for p in batch.get('test_points', []):
+            lines.append(f"- [{p.get('id', '')}] {p.get('detail', '')}（类型:{p.get('type', 'normal')}，优先级:{p.get('priority', 'P1')}）")
+        test_points_list = '\n'.join(lines) or '（无）'
+        prompt_file = self._PROMPT_REGISTRY.get(platform, 'common_test.md')
+        prompt = build_prompt(_DIR, prompt_file,
+            platform_label=batch.get('platform_label', platform),
+            framework=sc.get('framework', 'Playwright'),
+            assertion_focus=sc.get('assertion_focus', ''),
+            batch_index=batch.get('batch_index', 1),
+            test_points_list=test_points_list)
+        if self.llm:
+            response = self.llm.generate(prompt)
+        else:
+            response = self._get_template(platform)  # mock 降级
+        code = self._parse_response(response)
+        test_case = {
+            'function_name': f"batch{batch.get('batch_index', 1)}",
+            'scenario': batch.get('priority', 'medium'),
+            'test_code': code,
+            'priority': batch.get('priority', 'medium'),
+        }
+        # save_test_case 取 basename 作文件名前缀；这里用 platform 作占位源文件名
+        source_file = f"{platform}.py"
+        file_path = self.save_test_case(test_case, source_file)
+        print(f"  ✓ [{platform} · 第{batch.get('batch_index', 1)}批] 生成 {len(batch.get('test_points', []))} 个用例 → {file_path}")
+        return {'file_path': file_path, 'platform': platform, 'batch_index': batch.get('batch_index', 1)}
 
     def _parse_response(self, response):
         """解析LLM响应，提取代码块"""

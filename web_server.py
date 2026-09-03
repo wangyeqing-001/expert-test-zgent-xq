@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import threading
+from datetime import datetime
 from collections import deque
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -77,6 +78,25 @@ gen_agent = TestGeneratorAgent(api_key=api_key, base_url=base_url, test_type='we
 # Agent调用锁（防止并发请求竞态修改Agent内部state）
 _agent_lock = threading.Lock()
 
+# ---- 需求分析历史记录持久化（供前端 /api/history 拉取展示可点击链接）----
+HISTORY_FILE = os.path.join('generated_requirements', 'history.json')
+
+
+def _append_history(record: dict):
+    """追加一条需求分析历史记录到 JSON 文件（最新在前，最多保留100条）"""
+    try:
+        items = []
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                items = json.load(f)
+        items.insert(0, record)
+        items = items[:100]
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"写入历史记录失败: {e}")
+
 # 初始化飞书机器人（feishu_client存在即启用）
 feishu_bot = None
 if feishu_client:
@@ -110,7 +130,17 @@ def analyze_requirement():
 
         with _agent_lock:
             result = req_agent.process_query(query, title=doc_title)
-        
+
+        # 持久化历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接
+        meta = result.get('metadata') or {}
+        _append_history({
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'source_doc_url': meta.get('doc_url', ''),
+            'source_title': doc_title or meta.get('title') or query[:30],
+            'feishu_url': result.get('feishu_url'),
+            'local_path': result.get('local_path'),
+        })
+
         return jsonify({
             'success': True,
             'markdown': result['markdown'],
@@ -208,6 +238,20 @@ def get_status():
         'test_point_agent': point_agent.get_state(),
         'generator_agent': gen_agent.get_state()
     })
+
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    """需求分析历史记录列表（前端展示可点击的原始/生成文档链接）"""
+    try:
+        items = []
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                items = json.load(f)
+        return jsonify({'items': items})
+    except Exception as e:
+        logger.warning(f"读取历史记录失败: {e}")
+        return jsonify({'items': []})
 
 
 @app.route('/api/logs')
@@ -319,23 +363,42 @@ def run_pipeline():
         scenarios = point_result['scenarios']
         logger.info(f"测试点生成: {len(scenarios)}个场景")
         
-        # Step3: 测试代码生成
-        if not generate_all:
-            scenarios = [s for s in scenarios if s.get('priority') == 'high']
-        
+        # Step3: 测试代码生成（优先按端 TestBatch 路由，无 batches 退回逐 scenario）
+        batches = point_result.get('batches', [])
         generated_tests = []
-        for scenario in scenarios:
-            try:
-                gen_query = f"为{scenario.get('function', '')}生成{scenario.get('description', '')}的测试用例"
-                gen_result = gen_agent.process_query(gen_query, {})
-                with open(gen_result['file_path'], 'r', encoding='utf-8') as f:
-                    generated_tests.append({
-                        'path': gen_result['file_path'],
-                        'code': f.read(),
-                        'scenario': scenario
-                    })
-            except Exception as e:
-                logger.warning(f"测试生成失败: {e}")
+
+        if batches:
+            if not generate_all:
+                batches = [b for b in batches if b.get('priority') == 'P0']
+                logger.info(f"仅生成高优先级批次 ({len(batches)}批)")
+            for batch in batches:
+                try:
+                    gen_result = gen_agent.execute_batch(batch)
+                    with open(gen_result['file_path'], 'r', encoding='utf-8') as f:
+                        generated_tests.append({
+                            'path': gen_result['file_path'],
+                            'code': f.read(),
+                            'platform': gen_result.get('platform'),
+                            'batch_index': gen_result.get('batch_index'),
+                        })
+                except Exception as e:
+                    logger.warning(f"测试生成失败: {e}")
+        else:
+            # 旧链路（code/降级）：逐 scenario 调 process_query
+            if not generate_all:
+                scenarios = [s for s in scenarios if s.get('priority') == 'high']
+            for scenario in scenarios:
+                try:
+                    gen_query = f"为{scenario.get('function', '')}生成{scenario.get('description', '')}的测试用例"
+                    gen_result = gen_agent.process_query(gen_query, {})
+                    with open(gen_result['file_path'], 'r', encoding='utf-8') as f:
+                        generated_tests.append({
+                            'path': gen_result['file_path'],
+                            'code': f.read(),
+                            'scenario': scenario
+                        })
+                except Exception as e:
+                    logger.warning(f"测试生成失败: {e}")
         
         return jsonify({
             'success': True,

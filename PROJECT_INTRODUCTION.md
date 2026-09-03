@@ -10,12 +10,14 @@
 - **多Agent协作架构**：需求分析Agent + 测试点生成Agent + 测试生成Agent + 编排器协调（3步流水线）
 - **完整ReAct实现**：思考(Reasoning) + 行动(Acting)循环，包含记忆、工具、规划、反思四大模块
 - **飞书文档全链路集成**：需求分析与测试点均自动写入飞书文档（结构化JSON直写原生块），支持在线协作评审
-- **测试点双链路架构**：PRD直提（原始需求主材料+约束清单辅助门控）与代码分析链路并行，统一产出纯文本对齐四列表格 + JSON落盘
-- **下游数据传递**：测试点JSON（六字段schema）落盘供用例生成分批消费；需求分析文结构化解析传下游
+- **测试点双链路架构**：PRD直提（原始需求主材料+约束清单辅助门控）与代码分析链路并行，统一产出纯文本对齐四列表格 + JSON落盘（子端分组+同端内分批 TestBatch）
+- **下游数据传递**：测试点JSON（七字段+TestBatch批次）落盘，下游 TestGenerator 按 platform 路由该端专用 prompt 分批生成用例；需求分析文结构化解析传下游
+- **按端 prompt 路由**：7 套端专用 prompt（app/web/h5/common/backend/admin/e2e），各端测试框架/断言重点/前置条件分离，TestGenerator 按 `batch.platform` 自动匹配
 - **自然语言交互**：支持中文/英文自然语言指令，智能解析用户意图
 - **多LLM提供商支持**：阿里云百炼(DashScope)、DeepSeek、OpenAI GPT-4，三级优先级自动切换
 - **多测试类型覆盖**：Web UI (Playwright/Selenium)、移动端 (Appium)、API (requests)
 - **多渠道接入**：CLI交互式 + Web图形界面 + 飞书机器人对话 + 飞书链接独立脚本（均为Agent调用渠道）
+- **Web 体验优化**：实时日志面板（增量轮询展示）、分析期间按钮置灰防重复提交、需求分析历史记录（持久化原始文档链接+生成飞书文档链接，可点击回溯）
 - **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性
 
 ---
@@ -69,16 +71,16 @@ PythonProject_testagent/
 │   └── template_loader.py        # 测试模板加载器
 │
 ├── generated_tests/               # 测试代码输出
-├── generated_requirements/        # 需求分析文档输出
+├── generated_requirements/        # 需求分析文档输出（含 history.json 历史记录索引）
 ├── generated_testpoints/          # 测试点输出（对齐表格.md + JSON落盘）
 ├── tests/                         # 单元测试（structured_doc等）
 ├── demo/                          # 示例被分析代码
 ├── web/                           # Web前端资源
-│   └── index.html                # 前端页面
+│   └── index.html                # 前端页面（需求分析/测试点/测试生成 + 实时日志 + 历史记录）
 │
 ├── main.py                        # CLI入口（完整流水线 + 单独Agent调用）
 ├── run_requirement.py            # 独立脚本：飞书文档链接 → 需求分析（一步到位）
-├── web_server.py                 # Flask Web服务（含/api/pipeline、/api/feishu/parse）
+├── web_server.py                 # Flask Web服务（/api/requirement·/test_points·/generate·/pipeline·/feishu·/status·/logs·/history）
 ├── test_feishu_integration.py    # 集成验证：飞书PRD导入→需求分析→测试点全流程
 ├── test_requirement_analyzer.py  # 集成验证：3步流水线（需求分析→测试点）
 ├── test_optimization.py          # 集成验证：优化后的Agent流水线（DeepSeek）
@@ -159,16 +161,18 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
   原始PRD全文（主材料，唯一事实来源）
     ├→ 分支A：constraints_extract.md 提取约束清单（防遗漏索引）
     └→ 主流程：prd_to_testpoints.md（辅助材料注入门控：不作事实来源/无视推测/冲突以PRD为准）
-      ↓ 一次LLM直出端分组JSON（client.app/web/h5/common、backend、operation_backend）
-      ↓ 代码平铺为测试点（统一重编号01递增）+ 确定性对齐表格渲染（不二次调LLM）
+      ↓ 一次LLM直出端分组JSON（client.app/web/h5/common、backend、operation_backend、e2e）
+      ↓ 代码映射 platform（app/web/h5/common/backend/admin/e2e）+ 统一重编号01递增
+      ↓ _split_into_batches：同端内按 max_per_batch 切批 → List[TestBatch]（含 shared_context/batch_index/priority），飞书按端分节渲染（不二次调LLM）
 
 链路2：code分析（source='code'）
   generate_scenarios.md 生成scenarios → testpoints_table.md（用户方法论）二次LLM生成四列表格JSON
 ```
 
 **统一产出（两条链路同格式）**：
-- **测试点JSON**（六字段）：`{id, endpoint, detail, priority, source, type}`，落盘 `generated_testpoints/{标题}_{时间戳}.json`，source供下游追溯、type（normal/edge_case/error_handling）供分批
-- **纯文本对齐四列表格**：`测试点ID | 涉及端 | 测试点详情 | 优先级`，CJK宽度对齐，飞书以code块（block_type=14）写入规避渲染风险；本地.md同步保存
+- **测试点JSON**：`{id, endpoint, platform, detail, priority, source, type}`（七字段，加 `platform` 英文键供下游路由）+ `batches: List[TestBatch]`，落盘 `generated_testpoints/{标题}_{时间戳}.json`
+- **TestBatch 结构**：`{platform, platform_label, batch_index, priority, shared_context:{framework,assertion_focus}, test_points[], depends_on[]}`，同端内按可配置 `max_per_batch` 切批（app/web/h5/common=8、backend=12、admin=10、e2e=6），priority 取批内最高
+- **纯文本对齐四列表格**：`测试点ID | 涉及端 | 测试点详情 | 优先级`，飞书按端分节（每端 h2 标题 + code块表格，block_type=14）规避渲染风险，CJK宽度对齐；本地.md同步保存
 - 降级：JSON失败时确定性渲染同源数据，产出不断
 
 **关键方法**：
@@ -369,6 +373,13 @@ python web_server.py --port 5001
 
 访问：http://localhost:5001
 
+**界面功能**：
+- 需求分析 / 测试点生成 / 测试生成 三个标签页，支持飞书文档链接导入
+- 底部实时日志面板（增量轮询，可折叠/暂停/清空），分析期间按钮置灰防重复提交
+- 需求分析面板下方「历史记录」区，展示可点击的原始需求文档链接与生成的需求分析飞书文档链接
+
+> 启动时使用 `use_reloader=False`，避免长耗时请求（需求分析约1-2分钟）因代码改动触发 reloader 重启而被中断。
+
 #### API接口
 
 **1. 完整流水线（推荐）**
@@ -443,7 +454,22 @@ Content-Type: application/json
 GET /api/status
 ```
 
-**6. 飞书文档链接解析**
+**6. 实时日志（增量轮询）**
+```http
+GET /api/logs?since=0
+# 返回：{ logs: [{seq, text}], latest }
+# 前端底部日志面板按 seq 增量拉取，since 传上次 latest，避免全量重传
+```
+
+**7. 需求分析历史记录**
+```http
+GET /api/history
+# 返回：{ items: [{ created_at, source_doc_url, source_title, feishu_url, local_path }] }
+# 前端历史记录区展示可点击的「原始需求文档」与「需求分析飞书文档」链接
+# 每次需求分析成功后自动追加到 generated_requirements/history.json（最新在前，最多100条）
+```
+
+**8. 飞书文档链接解析**
 ```http
 POST /api/feishu/parse
 Content-Type: application/json
@@ -452,11 +478,11 @@ Content-Type: application/json
   "doc_url": "https://your_company.feishu.cn/docx/xxxxx"
 }
 
-# 返回：success + content（文档内容）+ doc_type + doc_token
+# 返回：success + content（文档内容）+ doc_type + doc_token + title
 # 供前端飞书链接输入框预检与内容预览使用（支持 docx/wiki）
 ```
 
-**7. 飞书机器人事件回调**
+**9. 飞书机器人事件回调**
 ```http
 POST /api/feishu/event
 Content-Type: application/json
@@ -678,8 +704,8 @@ LLM调用成功 → 智能生成高质量代码
 - **支持测试类型**：3种（Web/Mobile/API）
 - **支持LLM提供商**：3种（百炼DashScope/DeepSeek/OpenAI）
 - **交互方式**：4种（CLI/Web/飞书机器人/飞书链接独立脚本）
-- **飞书集成**：需求分析 + 测试点双文档自动写入 + 飞书机器人对话交互
-- **测试点产出**：四列对齐表格（飞书code块）+ 六字段JSON落盘，双链路统一
+- **飞书集成**：需求分析 + 测试点双文档自动写入 + 飞书机器人对话交互 + Web历史记录可点击回溯
+- **测试点产出**：四列对齐表格（飞书code块按端分节）+ 七字段JSON + TestBatch批次落盘，双链路统一
 
 ---
 
@@ -711,4 +737,4 @@ LLM调用成功 → 智能生成高质量代码
 
 ---
 
-**最后更新时间**：2026-08-28
+**最后更新时间**：2026-09-03

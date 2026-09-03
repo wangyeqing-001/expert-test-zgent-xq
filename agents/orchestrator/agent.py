@@ -102,26 +102,40 @@ class AgentOrchestrator:
             print(f"✓ 飞书测试点文档: {point_result['feishu_url']}")
         self._preview_scenarios(scenarios)
         
-        # Step 3: 测试代码生成
+        # Step 3: 测试代码生成（优先按端 TestBatch 路由，无 batches 退回逐 scenario）
         print(f"\n[Step 3/3] 测试生成Agent开始生成代码...")
         generated_files = []
-        
-        if not generate_all:
-            scenarios = [s for s in scenarios if s.get('priority') == 'high']
-            print(f"仅生成高优先级场景 ({len(scenarios)}个)")
-        
-        for i, scenario in enumerate(scenarios, 1):
-            print(f"\n  [{i}/{len(scenarios)}] 生成: {scenario['description']}")
-            
-            try:
-                result = self.test_generator.execute({
-                    'scenario': scenario,
-                    'source_file': file_path
-                })
-                generated_files.append(result['file_path'])
-            except Exception as e:
-                print(f"  ✗ 生成失败: {e}")
-                self._log_step('TestGenerator', {'status': 'failed', 'error': str(e)})
+        batches = point_result.get('batches', [])
+
+        if batches:
+            # 新链路：子端分组 + 同端内分批，按端 prompt 路由
+            if not generate_all:
+                batches = [b for b in batches if b.get('priority') == 'P0']
+                print(f"仅生成高优先级批次 ({len(batches)}批)")
+            for i, batch in enumerate(batches, 1):
+                print(f"\n  [{i}/{len(batches)}] {b.get('platform_label', batch.get('platform'))} · 第{batch.get('batch_index')}批 ({len(batch.get('test_points', []))}个测试点)")
+                try:
+                    result = self.test_generator.execute_batch(batch)
+                    generated_files.append(result['file_path'])
+                except Exception as e:
+                    print(f"  ✗ 生成失败: {e}")
+                    self._log_step('TestGenerator', {'status': 'failed', 'error': str(e)})
+        else:
+            # 旧链路（code/降级）：逐 scenario 调 execute
+            if not generate_all:
+                scenarios = [s for s in scenarios if s.get('priority') == 'high']
+                print(f"仅生成高优先级场景 ({len(scenarios)}个)")
+            for i, scenario in enumerate(scenarios, 1):
+                print(f"\n  [{i}/{len(scenarios)}] 生成: {scenario['description']}")
+                try:
+                    result = self.test_generator.execute({
+                        'scenario': scenario,
+                        'source_file': file_path
+                    })
+                    generated_files.append(result['file_path'])
+                except Exception as e:
+                    print(f"  ✗ 生成失败: {e}")
+                    self._log_step('TestGenerator', {'status': 'failed', 'error': str(e)})
         
         # 总结
         print(f"\n{'='*50}")
