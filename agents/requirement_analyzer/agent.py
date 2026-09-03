@@ -79,13 +79,16 @@ class RequirementAnalyzer(BaseAgent):
 
     # ==================== 自然语言入口 ====================
 
-    def process_query(self, query: str, title: str = None) -> dict:
+    def process_query(self, query: str, title: str = None, feishu_url: str = None) -> dict:
         """
         自然语言入口：自动识别输入类型（飞书链接 / PRD文本 / 代码路径）
         并路由到对应处理链路
+
+        :param feishu_url: 外部已解析的飞书文档链接（run_requirement.py 等入口手动拉内容时传入），
+                          用于在纯文本路径下也能拉取 mention_doc 关联文档
         """
         # 1. 优先检查是否为飞书文档链接
-        feishu_doc_url = self._extract_feishu_url(query)
+        feishu_doc_url = self._extract_feishu_url(query) or feishu_url
         if feishu_doc_url:
             return self._process_feishu_doc(feishu_doc_url, title)
 
@@ -96,15 +99,22 @@ class RequirementAnalyzer(BaseAgent):
         if not parsed.get('file_path') and (parsed.get('is_prd') or len(query) > 200):
             doc_title = title or "需求分析文档"
             raw = self._clean_doc_content(query)
-            # 提取并合并关联文档
-            raw = self._extract_and_merge_related_docs(raw)
+            # 优先从 blocks API 提取 mention_doc（raw_content Markdown 会丢内嵌文档 URL）
+            related_urls = []
+            if feishu_url and self.feishu_client:
+                try:
+                    token, dtype = FeishuClient.parse_doc_url(feishu_url)
+                    related_urls = self.feishu_client.get_related_doc_urls(token, dtype)
+                except Exception as e:
+                    print(f"[RequirementAnalyzer] 提取关联文档URL失败: {e}")
+            raw = self._extract_and_merge_related_docs(raw, related_urls)
             markdown, blocks = self._analyze_prd_content(raw)
-            local_path, feishu_url = self._save_and_publish(markdown, doc_title, blocks)
+            local_path, feishu_url_out = self._save_and_publish(markdown, doc_title, blocks)
 
             return {
                 'markdown': markdown,
                 'local_path': local_path,
-                'feishu_url': feishu_url,
+                'feishu_url': feishu_url_out,
                 'raw_content': raw,  # 保留清洗后的 PRD 全文，供下游测试点生成使用
             }
 
@@ -127,14 +137,16 @@ class RequirementAnalyzer(BaseAgent):
 
         doc_token, doc_type = FeishuClient.parse_doc_url(doc_url)
         doc_title = title or self.feishu_client.get_doc_title(doc_token, doc_type) or '飞书文档'
-        content = self.feishu_client.get_doc_content(doc_token, doc_type)
+        # 传 doc_url：让 FeishuClient 优先走 qadoc 拉取（Markdown 保留内嵌链接 + 关联文档列表）
+        content = self.feishu_client.get_doc_content(doc_token, doc_type, doc_url=doc_url)
 
         if not content or not content.strip():
             raise ValueError(f"飞书文档内容为空，请检查文档权限: {doc_url}")
 
-        # 清洗 + 拉取关联文档
+        # 清洗 + 拉取关联文档（qadoc 优先，已缓存 related_urls）
         content = self._clean_doc_content(content)
-        content = self._extract_and_merge_related_docs(content)
+        related_urls = self.feishu_client.get_related_doc_urls(doc_token, doc_type, doc_url=doc_url)
+        content = self._extract_and_merge_related_docs(content, related_urls)
 
         markdown, blocks = self._analyze_prd_content(content)
         local_path, feishu_url = self._save_and_publish(markdown, doc_title, blocks)
@@ -283,20 +295,29 @@ class RequirementAnalyzer(BaseAgent):
 
     # ==================== 关联文档拉取（新增） ====================
 
-    def _extract_and_merge_related_docs(self, content: str) -> str:
+    def _extract_and_merge_related_docs(self, content: str, related_urls: list = None) -> str:
         """
         从文档正文中提取关联飞书文档链接，拉取内容后拼接到主文档末尾。
         只做一层抓取，不递归；单个关联文档最多 3000 字符；拉取失败不中断。
+
+        :param content: 主文档内容（可能已被 raw_content 降级丢失 mention_doc URL）
+        :param related_urls: blocks API 提取的 mention_doc URL 列表（优先使用）
         """
         if not self.feishu_client:
             return content
 
-        # 匹配正文中所有飞书文档链接（docx/wiki/sheets）
+        # 优先用 blocks API 提取的 URL（mention_doc 不丢失）
+        urls = list(related_urls or [])
+
+        # 兜底：从 content 正则匹配显式 URL
         link_pattern = re.compile(
             r'https?://[\w.-]*feishu\.cn/(?:docx|wiki|sheets)/[a-zA-Z0-9]+',
             re.IGNORECASE
         )
-        urls = list(dict.fromkeys(link_pattern.findall(content)))  # 去重且保序
+        fallback_urls = list(dict.fromkeys(link_pattern.findall(content)))
+        for u in fallback_urls:
+            if u not in urls:
+                urls.append(u)
 
         if not urls:
             return content
@@ -330,7 +351,6 @@ class RequirementAnalyzer(BaseAgent):
                 continue
 
         if fetched == 0:
-            # 没有成功拉取任何关联文档，返回原始内容
             return content
 
         print(f"[RequirementAnalyzer] 共拉取 {fetched} 篇关联文档，已合并到主文档")

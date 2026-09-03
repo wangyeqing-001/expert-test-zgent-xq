@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 class FeishuClient:
     """飞书开放平台API客户端"""
     
+    # qadoc 内部网关：统一拉取飞书文档 Markdown + 关联文档列表（绕开飞书 OpenAPI 限制）
+    _QADOC_URL = "https://qadoc.snowballfinance.com/ai/inter/queryReqByURL"
+
     def __init__(self, app_id: str, app_secret: str):
         """
         初始化飞书客户端
@@ -29,6 +32,33 @@ class FeishuClient:
         self.session.proxies = {'http': None, 'https': None}
         self.session.trust_env = False
     
+    def _qadoc_fetch(self, doc_url: str) -> dict:
+        """通过 qadoc 内部网关拉取飞书文档（Markdown + 关联文档列表）
+        返回: {'content': str, 'related_urls': list, 'title': str}
+        失败返回 None
+        """
+        try:
+            r = self.session.get(
+                self._QADOC_URL,
+                params={'url': doc_url},
+                timeout=15
+            )
+            data = r.json()
+            if data.get('result_code') != 0:
+                logger.warning(f"qadoc返回非0 code: {data}")
+                return None
+            inner = data.get('data', {})
+            content = inner.get('content_text', '')
+            title = inner.get('title', '')
+            sub_ids = inner.get('sub_document_ids', '')
+            related_urls = []
+            if sub_ids:
+                related_urls = [u.strip() for u in sub_ids.split(',') if u.strip()]
+            return {'content': content, 'related_urls': related_urls, 'title': title}
+        except Exception as e:
+            logger.warning(f"qadoc拉取失败: {e}")
+            return None
+
     def get_access_token(self) -> str:
         """获取访问令牌（自动刷新过期token）"""
         # 提前60秒刷新，避免边界过期
@@ -62,18 +92,37 @@ class FeishuClient:
             logger.error(f"请求飞书API失败: {str(e)}")
             raise
     
-    def get_doc_content(self, doc_token: str, doc_type: str = 'doc') -> str:
+    def get_doc_content(self, doc_token: str, doc_type: str = 'doc', doc_url: str = None) -> str:
         """
         获取飞书文档内容
         :param doc_token: 文档token（从URL中提取）
         :param doc_type: 文档类型 (doc/sheet/wiki)
-        :return: 文档纯文本内容
+        :param doc_url: 完整飞书文档URL（qadoc 优先用）
+        :return: 文档Markdown内容
         """
         logger.info(f"开始获取文档内容, token={doc_token}, type={doc_type}")
+
+        # 优先走 qadoc 内部网关（docx/wiki 支持，返回 Markdown + 关联文档 URL 不丢失）
+        qadoc_doc_url = doc_url
+        if not qadoc_doc_url:
+            # 构造标准 URL
+            domain = self.domain or 'xueqiu.feishu.cn'
+            type_path = {'doc': 'docx', 'wiki': 'wiki', 'sheet': 'sheets'}.get(doc_type, 'docx')
+            qadoc_doc_url = f"https://{domain}/{type_path}/{doc_token}"
+
+        if doc_type in ('doc', 'wiki'):
+            qadoc_result = self._qadoc_fetch(qadoc_doc_url)
+            if qadoc_result and qadoc_result['content']:
+                content = qadoc_result['content']
+                logger.info(f"qadoc拉取成功, 长度={len(content)}字符")
+                # 缓存关联文档 URL 供 get_related_doc_urls 使用
+                self._cached_related_urls = qadoc_result.get('related_urls', [])
+                return content
+
+        # qadoc 降级：飞书 OpenAPI
+        logger.info(f"qadoc不可用，降级飞书OpenAPI, token={doc_token}, type={doc_type}")
         token = self.get_access_token()
-        
         try:
-            # 根据文档类型选择API
             if doc_type == 'doc':
                 content = self._get_doc_text(doc_token, token)
             elif doc_type == 'sheet':
@@ -82,13 +131,94 @@ class FeishuClient:
                 content = self._get_wiki_content(doc_token, token)
             else:
                 raise ValueError(f"不支持的文档类型: {doc_type}")
-            
-            content_len = len(content)
-            logger.info(f"成功获取文档内容, 长度={content_len}字符")
+
+            logger.info(f"飞书OpenAPI拉取成功, 长度={len(content)}字符")
             return content
         except Exception as e:
             logger.error(f"获取文档内容失败: {str(e)}")
             raise
+
+    def get_related_doc_urls(self, doc_token: str, doc_type: str = 'doc', doc_url: str = None) -> list:
+        """获取关联文档 URL 列表
+        优先从 qadoc 的 sub_document_ids 获取（最准），
+        降级：用 blocks API 递归扫 mention_doc（飞书 raw_content 会丢 URL）
+        """
+        # 1. 优先用 get_doc_content 已缓存的 qadoc 结果
+        cached = getattr(self, '_cached_related_urls', None)
+        if cached is not None:
+            return cached
+
+        # 2. qadoc 独立拉取
+        if doc_type in ('doc', 'wiki'):
+            domain = self.domain or 'xueqiu.feishu.cn'
+            type_path = {'doc': 'docx', 'wiki': 'wiki'}.get(doc_type, 'docx')
+            url = doc_url or f"https://{domain}/{type_path}/{doc_token}"
+            qadoc_result = self._qadoc_fetch(url)
+            if qadoc_result:
+                return qadoc_result.get('related_urls', [])
+
+        # 3. 降级：blocks API 递归扫 mention_doc
+        logger.info(f"qadoc不可用，降级blocks API提取关联文档, token={doc_token}")
+        return self._extract_related_via_blocks(doc_token, doc_type)
+
+    def _extract_related_via_blocks(self, doc_token: str, doc_type: str) -> list:
+        """从 blocks API 递归提取 mention_doc 内嵌文档卡片的 URL 列表（降级路径）"""
+        logger.info(f"提取关联文档URL(blocks API), token={doc_token}, type={doc_type}")
+        token = self.get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # wiki → 先拿 obj_token (docx)
+        if doc_type == 'wiki':
+            node_resp = self.session.get(
+                f"{self.base_url}/wiki/v2/spaces/get_node?token={doc_token}", headers=headers, timeout=10
+            )
+            node_data = node_resp.json()
+            if node_data.get('code') != 0:
+                return []
+            obj_token = node_data['data']['node']['obj_token']
+            doc_type = 'doc'
+            doc_token = obj_token
+
+        if doc_type != 'doc':
+            return []
+
+        try:
+            meta_resp = self.session.get(
+                f"{self.base_url}/docx/v1/documents/{doc_token}", headers=headers, timeout=10
+            )
+            meta_data = meta_resp.json()
+            if meta_data.get('code') != 0:
+                return []
+            document_id = meta_data['data']['document']['document_id']
+
+            blocks_resp = self.session.get(
+                f"{self.base_url}/docx/v1/documents/{document_id}/blocks?page_size=500",
+                headers=headers, timeout=15
+            )
+            blocks_data = blocks_resp.json()
+            if blocks_data.get('code') != 0:
+                return []
+            blocks = blocks_data.get('data', {}).get('items', [])
+
+            def _walk(obj):
+                found = []
+                if isinstance(obj, dict):
+                    md = obj.get('mention_doc')
+                    if isinstance(md, dict) and md.get('url'):
+                        found.append(md['url'])
+                    for v in obj.values():
+                        found.extend(_walk(v))
+                elif isinstance(obj, list):
+                    for item in obj:
+                        found.extend(_walk(item))
+                return found
+
+            urls = list(dict.fromkeys(_walk(blocks)))
+            logger.info(f"blocks API发现 {len(urls)} 个关联文档URL")
+            return urls
+        except Exception as e:
+            logger.warning(f"blocks API提取关联文档URL失败: {str(e)}")
+            return []
 
     def get_doc_title(self, doc_token: str, doc_type: str = 'doc') -> str:
         """获取飞书文档标题"""
@@ -98,30 +228,35 @@ class FeishuClient:
 
         try:
             if doc_type == 'wiki':
-                # wiki需要先获取节点信息拿到obj_token
-                meta_url = f"{self.base_url}/wiki/v2/spaces/get_node"
-                resp = self.session.get(meta_url, headers=headers, params={"token": doc_token}, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get('code') != 0:
-                    logger.warning(f"获取wiki节点失败: {data.get('msg')}")
-                    return ''
-                doc_token = data['data']['node'].get('obj_token', doc_token)
-
-            meta_url = f"{self.base_url}/docx/v1/documents/{doc_token}"
-            resp = self.session.get(meta_url, headers=headers, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get('code') != 0:
-                logger.warning(f"获取文档元数据失败: {data.get('msg')}")
+                # wiki 需要先查节点获取 obj_token + obj_type
+                node_resp = self.session.get(
+                    f"{self.base_url}/wiki/v2/spaces/get_node?token={doc_token}", headers=headers, timeout=10
+                )
+                node_data = node_resp.json()
+                if node_data.get('code') == 0:
+                    return node_data['data']['node'].get('title', '')
                 return ''
-            title = data['data']['document'].get('title', '')
-            logger.info(f"文档标题: {title}")
-            return title
+            elif doc_type == 'sheet':
+                meta_resp = self.session.get(
+                    f"{self.base_url}/sheets/v3/spreadsheets/{doc_token}", headers=headers, timeout=10
+                )
+                meta_data = meta_resp.json()
+                if meta_data.get('code') == 0:
+                    return meta_data['data']['spreadsheet'].get('title', '')
+                return ''
+            else:
+                # docx: 先拿 document_id 再查 title
+                meta_resp = self.session.get(
+                    f"{self.base_url}/docx/v1/documents/{doc_token}", headers=headers, timeout=10
+                )
+                meta_data = meta_resp.json()
+                if meta_data.get('code') == 0:
+                    return meta_data['data']['document'].get('title', '')
+                return ''
         except Exception as e:
-            logger.warning(f"获取文档标题失败: {e}")
+            logger.error(f"获取文档标题失败: {str(e)}")
             return ''
-    
+
     def _get_doc_text(self, doc_token: str, token: str) -> str:
         """获取云文档文本内容"""
         logger.debug(f"获取云文档元数据, doc_token={doc_token}")

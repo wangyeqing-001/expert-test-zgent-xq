@@ -65,7 +65,7 @@ def run(feishu_url: str):
     t2 = time.time()
     agent = RequirementAnalyzer(llm_client=llm, feishu_client=feishu)
     print(f"\n[3/5] 开始需求分析...")
-    result = agent.process_query(content, title=title)
+    result = agent.process_query(content, title=title, feishu_url=feishu_url)
     print(f"  需求分析耗时: {time.time()-t2:.2f}s")
 
     # 4. 输出结果
