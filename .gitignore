@@ -58,3 +58,4 @@ Thumbs.db
 # Test Coverage
 .coverage
 htmlcov/
+.trae/

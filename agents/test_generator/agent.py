@@ -309,9 +309,23 @@ class TestGeneratorAgent(BaseAgent):
         return {'file_path': file_path, 'platform': platform, 'batch_index': batch.get('batch_index', 1)}
 
     def _parse_response(self, response):
-        """解析LLM响应，提取代码块"""
+        """解析LLM响应，提取Python代码块
+        - 优先 ```python ``` 标记
+        - 找不到时检测是否有非Python语言标记（typescript/javascript/ts/js），有则报错（防TS代码存进.py）
+        - 无任何代码块标记时检查内容是否像Python特征，像则直接返回，否则报错
+        """
         if '```python' in response:
             start = response.find('```python') + 9
             end = response.find('```', start)
             return response[start:end].strip()
-        return response.strip()
+        import re as _re
+        lang_block = _re.search(r'```(typescript|javascript|\bts\b|\bjs\b)\s*\n', response, _re.IGNORECASE)
+        if lang_block:
+            raise ValueError(f"LLM返回了{lang_block.group(1)}代码，期望Python。请检查prompt语言约束")
+        # 无标记，检查内容是否像Python
+        stripped = response.strip()
+        python_indicators = ['def test_', 'import pytest', 'from playwright.sync_api',
+                             'from appium', 'import requests', 'import httpx', 'def ', 'import ']
+        if any(ind in stripped for ind in python_indicators):
+            return stripped
+        raise ValueError("LLM响应未检测到Python代码块，无法解析")
