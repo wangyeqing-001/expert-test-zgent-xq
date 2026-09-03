@@ -134,7 +134,9 @@ def analyze_requirement():
 
         # 持久化历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接
         meta = result.get('metadata') or {}
+        task_id = f"REQ-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         _append_history({
+            'task_id': task_id,
             'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'source_doc_url': meta.get('doc_url', ''),
             'source_title': doc_title or meta.get('title') or query[:30],
@@ -144,6 +146,7 @@ def analyze_requirement():
 
         return jsonify({
             'success': True,
+            'task_id': task_id,
             'markdown': result['markdown'],
             'local_path': result['local_path'],
             'feishu_url': result.get('feishu_url'),
@@ -163,7 +166,78 @@ def generate_test_points():
         query = data.get('query', '')
         test_type = data.get('test_type', 'web')
         source = data.get('source', 'code')
+        task_id = data.get('task_id', '')
+        prd_url = data.get('prd_url', '')
+        raw_prd_text = data.get('raw_prd', '')
         
+        # task_id 优先：根据 ID 从 history 找到需求分析 md，跳过需求分析直接出测试点
+        if task_id:
+            req_md_text = ''
+            req_title = ''
+            try:
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    items = json.load(f)
+                for it in items:
+                    if it.get('task_id') == task_id or task_id in it.get('local_path', ''):
+                        local_path = it.get('local_path', '')
+                        if local_path and os.path.exists(local_path):
+                            with open(local_path, 'r', encoding='utf-8') as f:
+                                req_md_text = f.read()
+                        req_title = it.get('source_title', '')
+                        break
+            except Exception as e:
+                logger.warning(f"task_id 查找失败: {e}")
+            if not req_md_text:
+                return jsonify({'error': f'任务 {task_id} 未找到对应需求分析文档'}), 404
+            logger.info(f"task_id={task_id}, 加载需求分析文档 {len(req_md_text)}字符")
+            with _agent_lock:
+                result = point_agent.execute({
+                    'requirements': [{'function': 'all', 'name': req_title, 'complexity': 'medium',
+                                      'test_points': ['功能逻辑'], 'description': req_md_text[:6000]}],
+                    'test_type': test_type,
+                    'source': 'prd',
+                    'raw_prd': req_md_text,
+                    'title': req_title,
+                })
+            return jsonify({
+                'success': True,
+                'task_id': task_id,
+                'scenarios': result['scenarios'],
+                'metadata': result.get('metadata', {}),
+                'batches': result.get('batches', []),
+                'feishu_url': result.get('feishu_url'),
+                'local_path': result.get('local_path'),
+            })
+
+        # Debug: 直接传 prd_url 或 raw_prd 跳过需求分析
+        if prd_url or raw_prd_text:
+            if prd_url and not raw_prd_text:
+                # 从飞书拉 PRD
+                feishu_url = prd_url
+                doc_type = 'wiki' if '/wiki/' in feishu_url else 'doc'
+                token = feishu_url.split('/')[-1].split('?')[0]
+                try:
+                    raw_prd_text = feishu_client.get_doc_content(token, doc_type, doc_url=feishu_url)
+                except Exception as e:
+                    return jsonify({'error': f'飞书PRD拉取失败: {e}'}), 500
+            with _agent_lock:
+                result = point_agent.execute({
+                    'requirements': [{'function': 'all', 'name': 'PRD文档', 'complexity': 'medium',
+                                      'test_points': ['功能逻辑'], 'description': raw_prd_text[:6000]}],
+                    'test_type': test_type,
+                    'source': 'prd',
+                    'raw_prd': raw_prd_text,
+                    'title': 'PRD直提',
+                })
+            return jsonify({
+                'success': True,
+                'scenarios': result['scenarios'],
+                'metadata': result.get('metadata', {}),
+                'batches': result.get('batches', []),
+                'feishu_url': result.get('feishu_url'),
+                'local_path': result.get('local_path'),
+            })
+
         if requirements:
             # 结构化输入
             exec_input = {

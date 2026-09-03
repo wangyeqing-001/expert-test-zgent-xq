@@ -138,7 +138,7 @@ def struct_to_markdown(nodes: list) -> str:
             headers, rows = n['headers'], n['rows']
             lines.append('| ' + ' | '.join(headers) + ' |')
             lines.append('| ' + ' | '.join([':---'] * len(headers)) + ' |')
-            lines.extend('| ' + ' | '.join(r) + ' |' for r in rows)
+            lines.extend('| ' + ' | '.join(str(c) if c is not None else '' for c in r) + ' |' for r in rows)
             lines.append('')
         elif t == 'code':
             lines.append('```')

@@ -410,7 +410,11 @@
             <!-- 测试点生成面板 -->
             <div id="testpoints-panel" class="content" style="display:none;">
                 <div class="input-section">
-                    <label for="tp-query">输入查询：</label>
+                    <label for="tp-task-id">🆔 任务ID（Debug：输入后跳过需求分析，直接加载已有需求分析）：</label>
+                    <input type="text" id="tp-task-id" placeholder="REQ-20260903-180737 或粘贴历史记录里的任务ID" style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:4px;margin-bottom:12px;font-family:monospace">
+                    <div style="font-size:12px;color:#888;margin-bottom:12px">💡 填了任务ID就走 PRD 直提链路，自动按端分组+分批生成测试点</div>
+
+                    <label for="tp-query">或直接输入查询（简单场景）：</label>
                     <textarea id="tp-query" placeholder="例如：根据login功能生成测试场景"></textarea>
                     <div class="examples">
                         <h4>💡 示例（点击快速填充）：</h4>
@@ -615,12 +619,35 @@
             if (metaParts.length) {
                 html += `<p style="margin-bottom:10px;color:#6c757d;font-size:13px"><strong>元数据:</strong> ${metaParts.join(' · ')}</p>`;
             }
+            if (data.task_id) {
+                html += `<p style="margin-bottom:10px;background:#e3f2fd;padding:8px 12px;border-radius:4px;border-left:3px solid #1890ff">
+                    <strong>🆔 任务ID:</strong> <code style="background:#fff;padding:2px 6px;border-radius:3px;font-size:13px">${data.task_id}</code>
+                    <span style="color:#6c757d;font-size:12px;margin-left:8px">（复制后可在测试点/测试代码面板直接粘贴，跳过需求分析步骤）</span>
+                    <button onclick="navigator.clipboard.writeText('${data.task_id}')" style="margin-left:8px;padding:2px 8px;font-size:12px;cursor:pointer">复制</button>
+                </p>`;
+            }
             if (data.markdown) {
                 const preview = data.markdown.length > 2000 ? data.markdown.slice(0, 2000) + '\n...(已截断，完整内容见飞书文档/本地文件)' : data.markdown;
                 html += `<details><summary style="cursor:pointer;color:#495057;font-weight:600">查看需求分析预览</summary><pre class="code-block" style="max-height:320px;margin-top:10px"><code>${escapeHtml(preview)}</code></pre></details>`;
             }
 
+            // 存储结果供测试点面板引用
+            window.lastRequirementResult = data;
+            // 加「一键传给测试点」按钮
+            html += `<div style="margin-top:15px;padding:12px;background:#e8f5e9;border-radius:6px;border:1px solid #4caf50">
+                <span style="color:#2e7d32;font-weight:600">✓ 需求分析已完成，可一键生成测试点</span>
+                <button class="btn" onclick="forwardToTestPoints()" style="margin-left:12px;background:#4caf50">➡️ 传给测试点生成</button>
+            </div>`;
             document.getElementById('req-content').innerHTML = html;
+        }
+
+        function forwardToTestPoints() {
+            const data = window.lastRequirementResult;
+            if (!data) { alert('请先完成需求分析'); return; }
+            switchTab('testpoints', document.querySelector('.tab[onclick*=testpoints]'));
+            if (data.task_id) document.getElementById('tp-task-id').value = data.task_id;
+            setTimeout(() => generateTestPoints(), 300);
+        }
         }
 
         // 加载需求分析历史记录（原始需求文档链接 + 生成的需求分析飞书文档链接，可点击打开）
@@ -664,7 +691,17 @@
         async function generateTestPoints() {
             if (isProcessing) return;
             const query = document.getElementById('tp-query').value.trim();
-            if (!query) { alert('请输入查询内容'); return; }
+            const taskId = document.getElementById('tp-task-id').value.trim();
+
+            let body = {};
+            if (taskId) {
+                body.task_id = taskId;
+            } else if (query) {
+                body.query = query;
+            } else {
+                alert('请输入任务ID 或 查询内容');
+                return;
+            }
 
             showLoading('tp-btn', 'tp-result');
 
@@ -672,7 +709,7 @@
                 const response = await fetch('/api/test_points', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query})
+                    body: JSON.stringify(body)
                 });
                 const data = await response.json();
                 hideLoading('tp-btn', 'tp-result');

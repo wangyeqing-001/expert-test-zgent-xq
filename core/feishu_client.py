@@ -863,8 +863,12 @@ class FeishuClient:
             if resp.json().get('code') != 0:
                 logger.warning(f"表格降级写入失败: {resp.json().get('msg')}")
 
-    def _parse_inline(self, text: str) -> list:
+    def _parse_inline(self, text) -> list:
         """解析行内Markdown格式(**bold**, `code`, *italic*)为飞书elements"""
+        if text is None:
+            return []
+        if not isinstance(text, str):
+            text = str(text)
         elements = []
         # 正则匹配 **bold**, `code`, *italic*
         pattern = r'(\*\*(.+?)\*\*|`([^`]+)`|\*(.+?)\*)'
