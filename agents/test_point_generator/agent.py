@@ -53,7 +53,7 @@ class TestPointGenerator(BaseAgent):
         super().__init__(name="TestPointGenerator", llm_client=llm_client)
         self.feishu_client = feishu_client
         self.output_dir = output_dir
-        self.feishu_folder = os.getenv('FEISHU_OUTPUT_FOLDER', '')
+        self.feishu_folder = os.getenv('FEISHU_TESTPOINT_FOLDER') or os.getenv('FEISHU_OUTPUT_FOLDER', '')
         os.makedirs(output_dir, exist_ok=True)
     
     def execute(self, input_data: dict) -> dict:
