@@ -484,6 +484,11 @@ class RequirementAnalyzer(BaseAgent):
 
     def _save_and_publish(self, markdown: str, title: str, struct_blocks: list = None) -> tuple:
         """保存本地 Markdown + 发布飞书文档"""
+        # 统一追加后缀（避免重复）
+        SUFFIX = '-需求分析'
+        if not title.endswith(SUFFIX):
+            title = title + SUFFIX
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_title = re.sub(r'[^\w\u4e00-\u9fff-]', '_', title)[:50]
         filename = f"{safe_title}_{timestamp}.md"

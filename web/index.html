@@ -571,10 +571,11 @@
 
             try {
                 const docTitle = document.getElementById('req-query').dataset.docTitle || '';
+                const docUrl = document.getElementById('req-query').dataset.docUrl || '';
                 const response = await fetch('/api/requirement', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query, doc_title: docTitle})
+                    body: JSON.stringify({query, doc_title: docTitle, doc_url: docUrl})
                 });
 
                 const data = await response.json();
@@ -840,6 +841,7 @@
                     const reqQuery = document.getElementById('req-query');
                     reqQuery.value = `根据以下需求文档分析测试需求：\n\n${content}`;
                     reqQuery.dataset.docTitle = data.title || '';
+                    reqQuery.dataset.docUrl = docUrl;  // 记住飞书原文链接（供后端关联文档整合）
 
                     const typeLabel = data.doc_type === 'doc' ? '文档' : data.doc_type === 'wiki' ? '知识库' : '表格';
                     const titlePart = data.title ? `《${data.title}》` : '';

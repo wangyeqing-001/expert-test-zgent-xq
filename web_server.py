@@ -124,12 +124,13 @@ def analyze_requirement():
         data = request.json
         query = data.get('query', '')
         doc_title = data.get('doc_title')  # 飞书导入时携带的原文档标题
+        doc_url = data.get('doc_url')      # 飞书原文链接（供后端关联文档整合）
 
         if not query:
             return jsonify({'error': '查询内容不能为空'}), 400
 
         with _agent_lock:
-            result = req_agent.process_query(query, title=doc_title)
+            result = req_agent.process_query(query, title=doc_title, feishu_url=doc_url)
 
         # 持久化历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接
         meta = result.get('metadata') or {}
