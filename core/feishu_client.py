@@ -18,8 +18,8 @@ def retry(max_retries: int = 3, backoff_base: float = 1.0, backoff_max: float = 
     :param max_retries: 最大重试次数（不含首次）
     :param backoff_base: 指数退避基数（秒），第 n 次等待 backoff_base * 2^n
     :param backoff_max: 退避上限（秒）
-    :param retry_on_exception: 哪些异常触发重试
-    :param retry_on_http_status: 哪些 HTTP 状态码触发重试
+    :param retry_on_exception: 哪些异常触发重试（注意：HTTPError 会额外检查状态码）
+    :param retry_on_http_status: 哪些 HTTP 状态码触发重试（默认仅 5xx）
     """
     def decorator(func):
         @functools.wraps(func)
@@ -35,7 +35,22 @@ def retry(max_retries: int = 3, backoff_base: float = 1.0, backoff_max: float = 
                                 f"HTTP {result.status_code}", response=result
                             )
                     return result
+                except requests.exceptions.HTTPError as e:
+                    # HTTPError 只对 5xx 重试，4xx 直接上抛（权限/不存在重试没用）
+                    status = e.response.status_code if e.response is not None else None
+                    if status is not None and status not in retry_on_http_status:
+                        raise
+                    last_exc = e
+                    if attempt < max_retries:
+                        wait = min(backoff_base * (2 ** attempt), backoff_max)
+                        logger.warning(
+                            f"[重试] {func.__name__} 第{attempt+1}次失败: HTTP {status}, {wait:.1f}s后重试"
+                        )
+                        time.sleep(wait)
+                    else:
+                        logger.error(f"[重试] {func.__name__} 重试{max_retries}次后仍失败: HTTP {status}")
                 except retry_on_exception as e:
+                    # 其他 RequestException（连接超时/连接断开等）全部重试
                     last_exc = e
                     if attempt < max_retries:
                         wait = min(backoff_base * (2 ** attempt), backoff_max)
