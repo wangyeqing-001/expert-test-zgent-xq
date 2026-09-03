@@ -2,11 +2,52 @@
 import os
 import re
 import time
+import functools
 import requests
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def retry(max_retries: int = 3, backoff_base: float = 1.0, backoff_max: float = 10.0,
+          retry_on_exception: tuple = (requests.exceptions.RequestException,),
+          retry_on_http_status: tuple = (500, 502, 503, 504)):
+    """接口重试装饰器（仅用于读操作 + qadoc，写操作不重试避免重复创建）
+
+    :param max_retries: 最大重试次数（不含首次）
+    :param backoff_base: 指数退避基数（秒），第 n 次等待 backoff_base * 2^n
+    :param backoff_max: 退避上限（秒）
+    :param retry_on_exception: 哪些异常触发重试
+    :param retry_on_http_status: 哪些 HTTP 状态码触发重试
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    result = func(self, *args, **kwargs)
+                    # 如果返回是 Response 对象，检查状态码
+                    if isinstance(result, requests.Response):
+                        if result.status_code in retry_on_http_status:
+                            raise requests.exceptions.HTTPError(
+                                f"HTTP {result.status_code}", response=result
+                            )
+                    return result
+                except retry_on_exception as e:
+                    last_exc = e
+                    if attempt < max_retries:
+                        wait = min(backoff_base * (2 ** attempt), backoff_max)
+                        logger.warning(
+                            f"[重试] {func.__name__} 第{attempt+1}次失败: {e}, {wait:.1f}s后重试"
+                        )
+                        time.sleep(wait)
+                    else:
+                        logger.error(f"[重试] {func.__name__} 重试{max_retries}次后仍失败: {e}")
+            raise last_exc
+        return wrapper
+    return decorator
 
 
 class FeishuClient:
@@ -32,33 +73,39 @@ class FeishuClient:
         self.session.proxies = {'http': None, 'https': None}
         self.session.trust_env = False
     
+    @retry(max_retries=3)
     def _qadoc_fetch(self, doc_url: str) -> dict:
         """通过 qadoc 内部网关拉取飞书文档（Markdown + 关联文档列表）
         返回: {'content': str, 'related_urls': list, 'title': str}
-        失败返回 None
+        重试3次后仍失败抛异常（由外层 get_doc_content 降级到飞书OpenAPI）
         """
-        try:
-            r = self.session.get(
-                self._QADOC_URL,
-                params={'url': doc_url},
-                timeout=15
-            )
-            data = r.json()
-            if data.get('result_code') != 0:
-                logger.warning(f"qadoc返回非0 code: {data}")
-                return None
-            inner = data.get('data', {})
-            content = inner.get('content_text', '')
-            title = inner.get('title', '')
-            sub_ids = inner.get('sub_document_ids', '')
-            related_urls = []
-            if sub_ids:
-                related_urls = [u.strip() for u in sub_ids.split(',') if u.strip()]
-            return {'content': content, 'related_urls': related_urls, 'title': title}
-        except Exception as e:
-            logger.warning(f"qadoc拉取失败: {e}")
-            return None
+        r = self.session.get(
+            self._QADOC_URL,
+            params={'url': doc_url},
+            timeout=15
+        )
+        # 非2xx让装饰器触发重试
+        r.raise_for_status()
+        data = r.json()
+        if data.get('result_code') != 0:
+            # 5xx 让装饰器重试，4xx 直接抛
+            status = data.get('status') or data.get('code')
+            if status and 500 <= int(status) < 600:
+                raise requests.exceptions.HTTPError(
+                    f"qadoc HTTP {status}: {data.get('error', '')}", response=r
+                )
+            logger.warning(f"qadoc返回非0 code(不重试): {data}")
+            raise ValueError(f"qadoc返回非0 code: {data}")
+        inner = data.get('data', {})
+        content = inner.get('content_text', '')
+        title = inner.get('title', '')
+        sub_ids = inner.get('sub_document_ids', '')
+        related_urls = []
+        if sub_ids:
+            related_urls = [u.strip() for u in sub_ids.split(',') if u.strip()]
+        return {'content': content, 'related_urls': related_urls, 'title': title}
 
+    @retry(max_retries=3)
     def get_access_token(self) -> str:
         """获取访问令牌（自动刷新过期token）"""
         # 提前60秒刷新，避免边界过期
@@ -111,16 +158,19 @@ class FeishuClient:
             qadoc_doc_url = f"https://{domain}/{type_path}/{doc_token}"
 
         if doc_type in ('doc', 'wiki'):
-            qadoc_result = self._qadoc_fetch(qadoc_doc_url)
-            if qadoc_result and qadoc_result['content']:
-                content = qadoc_result['content']
-                logger.info(f"qadoc拉取成功, 长度={len(content)}字符")
-                # 缓存关联文档 URL 供 get_related_doc_urls 使用
-                self._cached_related_urls = qadoc_result.get('related_urls', [])
-                return content
+            try:
+                qadoc_result = self._qadoc_fetch(qadoc_doc_url)
+                if qadoc_result and qadoc_result['content']:
+                    content = qadoc_result['content']
+                    logger.info(f"qadoc拉取成功, 长度={len(content)}字符")
+                    # 缓存关联文档 URL 供 get_related_doc_urls 使用
+                    self._cached_related_urls = qadoc_result.get('related_urls', [])
+                    return content
+            except Exception as e:
+                logger.warning(f"qadoc拉取失败(重试后): {e}, 降级飞书OpenAPI")
 
         # qadoc 降级：飞书 OpenAPI
-        logger.info(f"qadoc不可用，降级飞书OpenAPI, token={doc_token}, type={doc_type}")
+        logger.info(f"降级飞书OpenAPI, token={doc_token}, type={doc_type}")
         token = self.get_access_token()
         try:
             if doc_type == 'doc':
@@ -153,14 +203,18 @@ class FeishuClient:
             domain = self.domain or 'xueqiu.feishu.cn'
             type_path = {'doc': 'docx', 'wiki': 'wiki'}.get(doc_type, 'docx')
             url = doc_url or f"https://{domain}/{type_path}/{doc_token}"
-            qadoc_result = self._qadoc_fetch(url)
-            if qadoc_result:
-                return qadoc_result.get('related_urls', [])
+            try:
+                qadoc_result = self._qadoc_fetch(url)
+                if qadoc_result:
+                    return qadoc_result.get('related_urls', [])
+            except Exception as e:
+                logger.warning(f"qadoc拉取关联文档失败(重试后): {e}, 降级blocks API")
 
         # 3. 降级：blocks API 递归扫 mention_doc
         logger.info(f"qadoc不可用，降级blocks API提取关联文档, token={doc_token}")
         return self._extract_related_via_blocks(doc_token, doc_type)
 
+    @retry(max_retries=3)
     def _extract_related_via_blocks(self, doc_token: str, doc_type: str) -> list:
         """从 blocks API 递归提取 mention_doc 内嵌文档卡片的 URL 列表（降级路径）"""
         logger.info(f"提取关联文档URL(blocks API), token={doc_token}, type={doc_type}")
@@ -257,6 +311,7 @@ class FeishuClient:
             logger.error(f"获取文档标题失败: {str(e)}")
             return ''
 
+    @retry(max_retries=3)
     def _get_doc_text(self, doc_token: str, token: str) -> str:
         """获取云文档文本内容"""
         logger.debug(f"获取云文档元数据, doc_token={doc_token}")
@@ -299,6 +354,7 @@ class FeishuClient:
             logger.error(f"请求飞书文档API失败: {str(e)}")
             raise
     
+    @retry(max_retries=3)
     def _get_sheet_content(self, sheet_token: str, token: str) -> str:
         """获取电子表格内容（简化版，返回CSV格式）"""
         logger.debug(f"获取电子表格元数据, sheet_token={sheet_token}")
@@ -350,6 +406,7 @@ class FeishuClient:
             logger.error(f"请求飞书表格API失败: {str(e)}")
             raise
     
+    @retry(max_retries=3)
     def _get_wiki_content(self, wiki_token: str, token: str) -> str:
         """获取知识库节点内容"""
         logger.debug(f"获取知识库节点元数据, wiki_token={wiki_token}")
