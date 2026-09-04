@@ -356,6 +356,7 @@ def generate_test_points():
                 'batches': result.get('batches', []),
                 'feishu_url': result.get('feishu_url'),
                 'local_path': result.get('local_path'),
+                'json_path': result.get('json_path'),
             })
 
         # Debug: 直接传 prd_url 或 raw_prd 跳过需求分析
@@ -420,36 +421,97 @@ def generate_test_points():
 
 @app.route('/api/generate', methods=['POST'])
 def generate_test():
-    """测试生成接口 - Step3: 测试场景→测试代码"""
+    """测试生成接口 - Step3: 测试场景→测试代码
+    支持两种入口：
+    1. task_id: 从 generated_testpoints JSON 加载 batches → execute_batch 逐批生成
+    2. query + requirement_doc: 自然语言 → process_query（老路径）
+    """
     try:
         data = request.json
+        task_id = data.get('task_id', '')
         query = data.get('query', '')
         requirement_doc = data.get('requirement_doc', '')
         context = data.get('context', {})
-        
+
+        # ---- task_id 路径：从测试点 JSON 加载 batches 逐批生成 ----
+        if task_id:
+            # 从 history 找到该 task_id 对应的测试点 JSON 路径
+            tp_json_path = None
+            try:
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    items = json.load(f)
+                for it in items:
+                    if it.get('task_id') == task_id:
+                        tp_json_path = it.get('testpoints_json')
+                        break
+            except Exception as e:
+                logger.warning(f"task_id 查找测试点JSON失败: {e}")
+
+            # 兜底：按 task_id 中的日期前缀在 generated_testpoints/ 目录搜索
+            if not tp_json_path:
+                tp_dir = 'generated_testpoints'
+                if os.path.isdir(tp_dir):
+                    for fn in sorted(os.listdir(tp_dir), reverse=True):
+                        if fn.endswith('.json') and task_id.split('-')[-1][:6] in fn:
+                            tp_json_path = os.path.join(tp_dir, fn)
+                            break
+
+            if not tp_json_path or not os.path.exists(tp_json_path):
+                return jsonify({'error': f'任务 {task_id} 未找到测试点JSON，请先生成测试点'}), 404
+
+            with open(tp_json_path, 'r', encoding='utf-8') as f:
+                tp_data = json.load(f)
+            batches = tp_data.get('batches', [])
+            if not batches:
+                return jsonify({'error': '测试点JSON中无batches数据'}), 400
+
+            logger.info(f"task_id={task_id}, 加载测试点 {tp_data.get('total', 0)}个/{len(batches)}批 → 开始生成测试代码")
+            generated_files = []
+            with _agent_lock:
+                for batch in batches:
+                    try:
+                        result = gen_agent.execute_batch(batch)
+                        generated_files.append({
+                            'path': result['file_path'],
+                            'platform': batch.get('platform', ''),
+                            'platform_label': batch.get('platform_label', ''),
+                            'batch_index': batch.get('batch_index', 1),
+                        })
+                    except Exception as e:
+                        logger.error(f"batch生成失败 [{batch.get('platform', '')}-{batch.get('batch_index', 1)}]: {e}")
+
+            return jsonify({
+                'success': True,
+                'task_id': task_id,
+                'generated_files': [f['path'] for f in generated_files],
+                'test_files': generated_files,
+                'total_batches': len(batches),
+            })
+
+        # ---- 自然语言路径（老路径） ----
         full_query = query
         if requirement_doc:
             if query:
                 full_query = f"根据以下需求文档生成测试用例：\n\n{requirement_doc}\n\n补充说明：{query}"
             else:
                 full_query = f"根据以下需求文档生成测试用例：\n\n{requirement_doc}"
-        
+
         if not full_query:
             return jsonify({'error': '请输入需求文档或补充说明'}), 400
-        
+
         with _agent_lock:
             result = gen_agent.process_query(full_query, context)
-        
+
         with open(result['file_path'], 'r', encoding='utf-8') as f:
             test_code = f.read()
-        
+
         return jsonify({
             'success': True,
             'file_path': result['file_path'],
             'test_code': test_code,
             'test_case': result['test_case']
         })
-    
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
