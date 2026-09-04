@@ -258,8 +258,10 @@ def analyze_requirement():
         if not query:
             return jsonify({'error': '查询内容不能为空'}), 400
 
+        logger.info("========== Step 1/3: 需求分析 ==========")
         with _agent_lock:
             result = req_agent.process_query(query, title=doc_title, feishu_url=doc_url)
+        logger.info(f"✓ 需求分析完成: {result.get('title', '')}，本地: {result.get('local_path', '')}")
 
         # 持久化历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接 + YAPI接口链接
         meta = result.get('metadata') or {}
@@ -310,6 +312,7 @@ def generate_test_points():
         raw_prd_text = data.get('raw_prd', '')
         
         # task_id 优先：根据 ID 从 history 找到需求分析 md，跳过需求分析直接出测试点
+        logger.info("========== Step 2/3: 测试点生成 ==========")
         if task_id:
             req_md_text = ''
             req_title = ''
@@ -450,13 +453,19 @@ def _run_generate_in_background(task_id: str, payload: dict):
             'finished_at': None,
             'logs': [],
         })
-        # 覆盖 queued → running
         task['status'] = 'running'
         task['started_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    def _progress_log(text: str):
+        """同时写入 logger 和 task['logs']（供前端轮询）"""
+        logger.info(text)
+        with _generation_tasks_lock:
+            task['logs'].append({'ts': datetime.now().strftime('%H:%M:%S'), 'text': text})
+
     try:
         task_id_in = payload.get('task_id', '')
-        # ---- 复用 /api/generate 中 task_id 路径的全部逻辑 ----
+        _progress_log(f"========== Step 1/3: 加载测试点数据 task_id={task_id_in} ==========")
+
         # 从 history 查找测试点 JSON + 需求文档
         tp_json_path = None
         req_md_path = None
@@ -480,6 +489,7 @@ def _run_generate_in_background(task_id: str, payload: dict):
             pass
 
         if not tp_json_path or not os.path.exists(tp_json_path):
+            _progress_log(f"✗ 未找到测试点JSON，task_id={task_id_in}")
             task['status'] = 'failed'
             task['error'] = f'任务 {task_id_in} 未找到测试点JSON'
             task['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -488,6 +498,7 @@ def _run_generate_in_background(task_id: str, payload: dict):
         with open(tp_json_path, 'r', encoding='utf-8') as f:
             tp_data = json.load(f)
         batches = tp_data.get('batches', [])
+        _progress_log(f"✓ 测试点JSON加载成功，共 {tp_data.get('total', 0)} 个测试点，{len(batches)} 批次")
 
         # 加载需求文档
         requirement_context = '（无）'
@@ -495,8 +506,11 @@ def _run_generate_in_background(task_id: str, payload: dict):
             try:
                 with open(req_md_path, 'r', encoding='utf-8') as f:
                     requirement_context = f.read()[:8000]
-            except Exception:
-                pass
+                _progress_log(f"✓ 需求文档加载成功，{len(requirement_context)} 字符（截取前8000）")
+            except Exception as e:
+                _progress_log(f"⚠ 需求文档加载失败: {e}")
+        else:
+            _progress_log("⚠ 未找到需求文档，测试用例将仅基于测试点生成")
 
         # 大批次拆小
         _SPLIT_THRESHOLD = {}
@@ -515,12 +529,29 @@ def _run_generate_in_background(task_id: str, payload: dict):
             else:
                 flattened_batches.append(batch)
 
+        # 统计各平台分布
+        platform_dist = {}
+        for b in flattened_batches:
+            p = b.get('platform_label', b.get('platform', ''))
+            platform_dist[p] = platform_dist.get(p, 0) + len(b.get('test_points', []))
+        dist_str = ' · '.join(f"{k}({v})" for k, v in platform_dist.items())
+        _progress_log(f"✓ 分批完成：共 {len(flattened_batches)} 批，分布: {dist_str}")
+
         total = len(flattened_batches)
         with _generation_tasks_lock:
             task['total'] = total
 
+        # ========== Step 2: 逐批生成测试用例 ==========
+        _progress_log(f"========== Step 2/3: 逐批生成JSON测试用例（共{total}批） ==========")
+
         all_results = []
         for i, batch in enumerate(flattened_batches):
+            platform_label = batch.get('platform_label', '')
+            platform = batch.get('platform', '')
+            batch_idx = batch.get('batch_index', 1)
+            pts_count = len(batch.get('test_points', []))
+            _progress_log(f"--- [{i+1}/{total}] {platform_label} batch#{batch_idx}（{pts_count}测试点）---")
+
             try:
                 sc = batch.get('shared_context') or {}
                 sc['requirement_context'] = requirement_context
@@ -528,17 +559,21 @@ def _run_generate_in_background(task_id: str, payload: dict):
                 with _agent_lock:
                     result = gen_agent.execute_batch(batch)
                 all_results.append(result)
+                case_count = len(result.get('test_cases', []))
+                _progress_log(f"  ✓ {platform_label} batch#{batch_idx} → {case_count} 条用例")
             except Exception as e:
-                logger.error(f"batch生成失败 [{batch.get('platform', '')}-{batch.get('batch_index', 1)}]: {e}")
+                logger.error(f"batch生成失败 [{platform}-{batch_idx}]: {e}")
+                _progress_log(f"  ✗ {platform_label} batch#{batch_idx} 失败: {type(e).__name__}")
+
             with _generation_tasks_lock:
                 task['progress'] = i + 1
-                task['logs'].append({
-                    'ts': datetime.now().strftime('%H:%M:%S'),
-                    'text': f"[{batch.get('platform_label', '')}] batch#{batch.get('batch_index', 1)} → "
-                            f"{all_results[-1]['test_cases'] if all_results else '0'}条"
-                })
 
-        # 按端分组 → 飞书文档
+        total_cases = sum(len(r.get('test_cases', [])) for r in all_results)
+        _progress_log(f"✓ Step 2 完成：共生成 {total_cases} 条测试用例")
+
+        # ========== Step 3: 按端分组 → 飞书文档 ==========
+        _progress_log(f"========== Step 3/3: 按端大类整合 → 飞书文档 ==========")
+
         from agents.test_generator.agent import _PLATFORM_FOLDER_MAP, _PLATFORM_GROUP_LABEL
         by_group: dict[str, list] = {}
         group_platforms: dict[str, str] = {}
@@ -548,6 +583,8 @@ def _run_generate_in_background(task_id: str, payload: dict):
             by_group.setdefault(group_label, []).extend(r.get('test_cases', []))
             group_platforms.setdefault(group_label, platform)
 
+        _progress_log(f"按端分组：{', '.join(f'{k}({len(v)}条)' for k, v in by_group.items())}")
+
         feishu_docs = []
         if feishu_client:
             for group_label, cases in by_group.items():
@@ -556,6 +593,7 @@ def _run_generate_in_background(task_id: str, payload: dict):
                 platform = group_platforms[group_label]
                 folder_token = _PLATFORM_FOLDER_MAP.get(platform)
                 if not folder_token:
+                    _progress_log(f"⚠ {group_label} 无对应飞书文件夹配置，跳过")
                     continue
                 struct_nodes = []
                 if source_doc_url:
@@ -566,6 +604,7 @@ def _run_generate_in_background(task_id: str, payload: dict):
                     struct_nodes.append({'type': 'paragraph', 'text': f'测试点分析：[点击查看]({testpoint_doc_url})'})
                 struct_nodes.extend(gen_agent.cases_to_feishu_struct(cases, group_label))
                 safe_title = (req_title or task_id_in).replace('|', '-').strip()
+                _progress_log(f"  创建飞书文档：【{safe_title}】{group_label}测试用例（{len(cases)}条）")
                 try:
                     doc_result = feishu_client.create_doc_from_struct(
                         title=f"【{safe_title}】{group_label}测试用例",
@@ -574,10 +613,13 @@ def _run_generate_in_background(task_id: str, payload: dict):
                     )
                     feishu_docs.append({'group': group_label, 'platform': platform,
                                         'feishu_url': doc_result['url'], 'case_count': len(cases)})
+                    _progress_log(f"  ✓ {group_label} 飞书文档: {doc_result['url']}")
                 except Exception as e:
                     logger.error(f"[{group_label}] 飞书文档创建失败: {e}")
+                    _progress_log(f"  ✗ {group_label} 飞书文档创建失败: {type(e).__name__}")
+        else:
+            _progress_log("⚠ 飞书客户端未配置，跳过文档上传")
 
-        total_cases = sum(len(r.get('test_cases', [])) for r in all_results)
         with _generation_tasks_lock:
             task['status'] = 'completed'
             task['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -593,8 +635,11 @@ def _run_generate_in_background(task_id: str, payload: dict):
                 ],
             }
 
+        _progress_log(f"========== 全部完成：{total_cases}条用例，{len(feishu_docs)}个飞书文档 ==========")
+
     except Exception as e:
         logger.error(f"后台生成任务异常: {e}")
+        _progress_log(f"✗ 任务异常终止: {type(e).__name__}: {str(e)[:200]}")
         with _generation_tasks_lock:
             task['status'] = 'failed'
             task['error'] = str(e)[:500]

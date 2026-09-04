@@ -1206,6 +1206,7 @@
 
         // 页面加载后默认展开日志面板并开始拉取
         document.addEventListener('DOMContentLoaded', function() {
+            setProcessing(false);  // 页面加载时重置全局锁，防止刷新后按钮残留 disabled
             const p = document.getElementById('log-panel');
             p.classList.add('expanded');
             p.classList.remove('collapsed');

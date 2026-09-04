@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import logging
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 from agents.base_agent import BaseAgent
 from agents._prompt_utils import build_prompt
 from core.structured_doc import parse_struct_json, struct_to_markdown
@@ -293,13 +297,16 @@ class TestPointGenerator(BaseAgent):
         try:
             prompt = build_prompt(_DIR, 'constraints_extract.md',
                 prd_requirements=prd_text[:12000])
+            logger.info("  ▶ [LLM调用] 测试点-约束清单提取 (max_tokens=4000)")
+            t0 = time.time()
             response = self.llm.generate(prompt, max_tokens=4000)
+            logger.info(f"  ◀ [LLM返回] 约束清单提取 耗时{time.time()-t0:.1f}s，输出{len(response or '')}字符")
             constraints = (response or '').strip()
             if constraints:
-                print(f"  [约束清单] 分支A提取成功: {len(constraints)}字符")
+                logger.info(f"  ✓ [约束清单] 提取成功: {len(constraints)}字符")
             return constraints
         except Exception as e:
-            print(f"  [约束清单] 分支A提取失败(跳过辅助材料): {type(e).__name__}: {str(e)[:100]}")
+            logger.warning(f"  ⚠ [约束清单] 提取失败(跳过): {type(e).__name__}: {str(e)[:100]}")
             return ''
     
     def _extract_testpoints_from_prd(self, prd_text: str, structured_constraints: str = None,
@@ -353,7 +360,10 @@ class TestPointGenerator(BaseAgent):
                 prd_requirements=prd_text[:12000],
                 structured_constraints=(structured_constraints or '（无辅助材料）')[:4000],
                 yapi_interfaces=yapi_text[:8000])
+            logger.info(f"  ▶ [LLM调用] 测试点-主提取 (prompt约{len(prompt)}字符, max_tokens=8000)")
+            t0 = time.time()
             response = self.llm.generate(prompt, max_tokens=8000)
+            logger.info(f"  ◀ [LLM返回] 测试点-主提取 耗时{time.time()-t0:.1f}s，输出{len(response or '')}字符")
 
             parsed, interface_index = self._parse_llm_json(response)
             points = []

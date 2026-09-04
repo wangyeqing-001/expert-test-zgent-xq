@@ -4,8 +4,11 @@ import os
 import re
 import json
 import time
+import logging
 from typing import Any
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from agents.base_agent import BaseAgent
 from agents._prompt_utils import build_prompt
@@ -220,7 +223,10 @@ class RequirementAnalyzer(BaseAgent):
         if USE_STRUCT_OUTPUT:
             # === 新链路：JSON 结构化输出 ===
             prompt = _build_parse_prompt(prd_text, prompt_file='prompts.md')
+            logger.info(f"  ▶ [LLM调用] 需求分析-JSON结构化链路 (attempt={attempt+1}, max_tokens=16000)")
+            t0 = time.time()
             response = self.llm.generate(prompt, max_tokens=16000)
+            logger.info(f"  ◀ [LLM返回] 需求分析-JSON结构化链路 耗时{time.time()-t0:.1f}s，输出{len(response)}字符")
 
             try:
                 nodes = parse_struct_json(response)
@@ -228,11 +234,14 @@ class RequirementAnalyzer(BaseAgent):
                     md = struct_to_markdown(nodes)
                     return md, nodes
             except Exception as e:
-                print(f"[RequirementAnalyzer] JSON解析失败，降级到Markdown链路: {e}")
+                logger.warning(f"  ⚠ JSON解析失败，降级到Markdown链路: {e}")
 
             # 降级：JSON 解析/校验失败 → 切旧 Prompt 重新调 LLM 拿 Markdown
             fallback_prompt = _build_parse_prompt(prd_text, prompt_file='prompts_markdown.md')
+            logger.info(f"  ▶ [LLM调用] 需求分析-降级Markdown链路 (max_tokens=12000)")
+            t0 = time.time()
             fallback_resp = self.llm.generate(fallback_prompt, max_tokens=12000)
+            logger.info(f"  ◀ [LLM返回] 需求分析-降级Markdown链路 耗时{time.time()-t0:.1f}s，输出{len(fallback_resp)}字符")
             fallback_md = self._strip_code_fence(fallback_resp)
             if len(fallback_md) > 50:
                 return fallback_md, None

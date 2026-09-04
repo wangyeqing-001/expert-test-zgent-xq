@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import time
 import logging
 from typing import Any
 from datetime import datetime
@@ -355,9 +356,12 @@ class TestGeneratorAgent(BaseAgent):
         test_cases = []
         if self.llm:
             try:
+                logger.info(f"  ▶ [LLM调用] 测试用例-{platform_label} batch#{batch.get('batch_index', 1)}（{len(pts)}测试点, max_tokens=3500, depth={_depth}）")
+                t0 = time.time()
                 response = self.llm.generate(prompt, max_tokens=3500)
+                logger.info(f"  ◀ [LLM返回] {platform_label} batch#{batch.get('batch_index', 1)} 耗时{time.time()-t0:.1f}s，输出{len(response or '')}字符")
             except Exception as e:
-                logger.warning(f"LLM 请求异常: {e}")
+                logger.warning(f"  ✗ LLM 请求异常: {e}")
                 response = ''
             test_cases = self._parse_json_response(response)
             # 截断 → 递归拆子批（最小粒度 2，再小就不拆了）
