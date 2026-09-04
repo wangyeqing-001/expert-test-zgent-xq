@@ -1,8 +1,10 @@
 """Web服务 - Flask后端API"""
 import os
+import re
 import json
 import logging
 import threading
+import requests
 from datetime import datetime
 from collections import deque
 from flask import Flask, request, jsonify, send_from_directory
@@ -89,6 +91,125 @@ gen_agent = TestGeneratorAgent(api_key=api_key, base_url=base_url, test_type='we
 # Agent调用锁（防止并发请求竞态修改Agent内部state）
 _agent_lock = threading.Lock()
 
+# ---- YAPI 接口详情拉取 ----
+YAPI_INTERFACE_API = 'https://ugcqams.snowballfinance.com/internal/getInterfaceData'
+_YAPI_ID_RE = re.compile(r'/interface/api/(\d+)')
+
+def _fetch_yapi_interface(yapi_url: str) -> dict:
+    """通过 YAPI URL 拉取接口详情，失败返回空 dict（含失败原因日志）"""
+    m = _YAPI_ID_RE.search(yapi_url)
+    if not m:
+        logger.info(f"YAPI 链接无具体接口ID，跳过拉取: {yapi_url}")
+        return {}
+    yapi_id = m.group(1)
+    try:
+        resp = requests.get(YAPI_INTERFACE_API, params={'interfaceYapiId': yapi_id}, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('code') == 0 or data.get('success'):
+                return data.get('data') or data
+            logger.warning(f"YAPI 接口返回业务错误 {yapi_url}: code={data.get('code')}, msg={data.get('message', '')}")
+            return data
+        elif resp.status_code == 404:
+            logger.warning(f"YAPI 接口已删除 {yapi_url}: 404")
+        elif resp.status_code in (401, 403):
+            logger.warning(f"YAPI 接口鉴权失败 {yapi_url}: {resp.status_code}")
+        else:
+            logger.warning(f"YAPI 接口HTTP异常 {yapi_url}: {resp.status_code}")
+    except requests.exceptions.Timeout:
+        logger.warning(f"YAPI 接口拉取超时 {yapi_url}")
+    except Exception as e:
+        logger.warning(f"YAPI 接口拉取失败 {yapi_url}: {e}")
+    return {}
+
+def _fetch_yapi_interfaces(yapi_urls: list) -> list:
+    """批量拉取 YAPI 接口详情并标准化
+
+    降级策略：
+    - 无 YAPI 链接（纯前端/设计改动）→ 返回 []，下游正常工作
+    - 部分接口拉取失败（已删除/超时/鉴权）→ 跳过失败项，返回成功项
+    - 全部失败 → 返回 []，下游收到"无接口数据"提示
+    """
+    if not yapi_urls:
+        return []
+    results = []
+    failed = 0
+    for url in yapi_urls:
+        raw = _fetch_yapi_interface(url)
+        if raw and (raw.get('path') or raw.get('title')):
+            results.append(_normalize_yapi_interface(url, raw))
+        else:
+            failed += 1
+    logger.info(f"YAPI 接口拉取完成: {len(results)}/{len(yapi_urls)} 成功, {failed} 失败/空")
+    return results
+
+def _normalize_yapi_interface(yapi_url: str, raw: dict) -> dict:
+    """将 YAPI 原始响应标准化为下游可消费的结构
+
+    输出字段：
+    - api_path:  接口路径
+    - method:    HTTP 方法
+    - title:     接口名称
+    - params:    入参定义（含必填、类型、校验规则）
+    - response_schema: 出参结构
+    - desc:      接口描述
+    - change_type:      留空（由 AI 在测试点阶段分析）
+    - related_requirement: 留空（由 AI 在测试点阶段分析）
+    """
+    # 入参标准化
+    params = []
+    # query 参数
+    for p in (raw.get('req_query') or []):
+        params.append({
+            'name': p.get('name', ''),
+            'type': p.get('type', 'string'),
+            'required': p.get('required', 0) == 1,
+            'desc': p.get('desc', p.get('example', '')),
+        })
+    # form 参数
+    for p in (raw.get('req_body_form') or []):
+        params.append({
+            'name': p.get('name', ''),
+            'type': p.get('type', 'string'),
+            'required': p.get('required', 0) == 1,
+            'desc': p.get('desc', ''),
+        })
+    # JSON body 参数（简化：保留原始 JSON schema 文本）
+    body_other = raw.get('req_body_other') or ''
+    if body_other and isinstance(body_other, str) and len(body_other) > 10:
+        params.append({'name': '_body', 'type': 'json', 'required': True, 'desc': body_other[:500]})
+
+    # 出参标准化
+    res_body = raw.get('res_body') or raw.get('res_body_other') or ''
+    if isinstance(res_body, dict):
+        res_body = json.dumps(res_body, ensure_ascii=False)[:2000]
+    elif res_body is None:
+        res_body = ''
+
+    return {
+        'yapi_url': yapi_url,
+        'api_path': raw.get('path', ''),
+        'method': (raw.get('method', '') or '').upper(),
+        'title': raw.get('title', raw.get('name', '')),
+        'params': params,
+        'response_schema': str(res_body)[:2000],
+        'desc': (raw.get('desc') or '')[:300],
+        'change_type': '',
+        'related_requirement': '',
+    }
+
+def _fetch_yapi_interfaces(yapi_urls: list) -> list:
+    """批量拉取 YAPI 接口详情并标准化"""
+    if not yapi_urls:
+        return []
+    results = []
+    for url in yapi_urls:
+        raw = _fetch_yapi_interface(url)
+        if raw:
+            results.append(_normalize_yapi_interface(url, raw))
+    logger.info(f"YAPI 接口拉取完成: {len(results)}/{len(yapi_urls)} 成功")
+    return results
+
 # ---- 需求分析历史记录持久化（供前端 /api/history 拉取展示可点击链接）----
 HISTORY_FILE = os.path.join('generated_requirements', 'history.json')
 
@@ -143,14 +264,13 @@ def analyze_requirement():
         with _agent_lock:
             result = req_agent.process_query(query, title=doc_title, feishu_url=doc_url)
 
-        # 持久化历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接
+        # 持久化历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接 + YAPI接口链接
         meta = result.get('metadata') or {}
         task_id = f"REQ-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         # 标题/URL 优先级：后端 metadata（最准）> 前端 doc_title/doc_url > query 截断
         final_title = (meta.get('title') or doc_title or '').strip()
         final_doc_url = (meta.get('doc_url') or doc_url or '').strip()
         if not final_title:
-            # 尝试从 feishu 生成文档名反推：如 "xxx-需求分析" → 取 xxx
             gen_title = result.get('feishu_title', '')
             if gen_title and gen_title.endswith('-需求分析'):
                 final_title = gen_title.replace('-需求分析', '')
@@ -163,6 +283,7 @@ def analyze_requirement():
             'source_title': final_title,
             'feishu_url': result.get('feishu_url'),
             'local_path': result.get('local_path'),
+            'yapi_urls': meta.get('yapi_urls', []),
         })
 
         return jsonify({
@@ -195,6 +316,7 @@ def generate_test_points():
         if task_id:
             req_md_text = ''
             req_title = ''
+            yapi_urls = []
             try:
                 with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
                     items = json.load(f)
@@ -205,12 +327,15 @@ def generate_test_points():
                             with open(local_path, 'r', encoding='utf-8') as f:
                                 req_md_text = f.read()
                         req_title = it.get('source_title', '')
+                        yapi_urls = it.get('yapi_urls', [])
                         break
             except Exception as e:
                 logger.warning(f"task_id 查找失败: {e}")
             if not req_md_text:
                 return jsonify({'error': f'任务 {task_id} 未找到对应需求分析文档'}), 404
-            logger.info(f"task_id={task_id}, 加载需求分析文档 {len(req_md_text)}字符")
+            logger.info(f"task_id={task_id}, 加载需求分析文档 {len(req_md_text)}字符, YAPI接口 {len(yapi_urls)}个")
+            # 拉取 YAPI 接口详情（供 AI 在测试点生成时参考）
+            yapi_interfaces = _fetch_yapi_interfaces(yapi_urls)
             with _agent_lock:
                 result = point_agent.execute({
                     'requirements': [{'function': 'all', 'name': req_title, 'complexity': 'medium',
@@ -221,6 +346,7 @@ def generate_test_points():
                     'title': req_title,
                     'source_doc_url': it.get('source_doc_url', ''),
                     'analysis_doc_url': it.get('feishu_url', ''),
+                    'yapi_interfaces': yapi_interfaces,
                 })
             return jsonify({
                 'success': True,

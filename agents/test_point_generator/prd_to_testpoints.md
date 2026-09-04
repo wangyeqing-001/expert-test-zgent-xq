@@ -7,12 +7,15 @@
 ## 核心原则
 
 - 所有测试点必须严格源于需求文档的显式描述。
+
 - 每个测试点必须原子化（只含一个独立维度），表述客观、可执行。
+
 - 同一个测试点如果同时适用于多个 scope（如 Web + H5 通用），**输出为多条**，每条 scope 字段填不同值。
 
 ## 输入材料
 
 - **主材料（唯一事实来源）**：`{prd_requirements}`，原始需求文档全文。所有测试点必须**严格基于此处显式描述**。
+
 - **辅助材料（可选，仅供参考）**：`{structured_constraints}`，由需求结构化提取专家产出的约束清单。
 
 ## 辅助材料使用规则（硬约束，必须遵守）
@@ -22,23 +25,78 @@
 3. **无视推测**：若 `{structured_constraints}` 中包含"推荐默认值"、"建议使用xx方案"、"置信度"等字样，在生成测试点时**完全忽略**。
 4. **冲突处理**：若 `{structured_constraints}` 与 `{prd_requirements}` 在某个点上存在歧义，**完全以** **`{prd_requirements}`** **为准**。
 
+## YAPI 接口数据（可选参考）
+
+以下是需求文档中涉及的接口清单（已标准化为结构化数据）：
+
+{yapi\_interfaces}
+
+### 接口数据字段说明
+
+每个接口包含以下字段：
+
+- **路径**: HTTP方法 + 接口路径
+
+- **描述**: 接口功能说明
+
+- **入参**: 参数名、类型、是否必填、描述
+
+- **出参**: 返回结构（JSON schema）
+
+- **变更类型**: 待分析（你需要判断：新增/修改/存量）
+
+- **关联需求**: 待分析（你需要判断：关联 PRD 中的哪个功能点）
+
+### 接口数据使用规则
+
+1. **给每个接口打标签**（重要，不要直接丢弃）：对照 PRD 需求内容，为每个接口打上以下 4 类标签之一：
+
+   - **本次新增**：全新接口，本次迭代首次创建
+
+   - **本次修改**：已有接口，本次迭代有参数/逻辑/返回结构变更
+
+   - **存量复用-建议回归**：已有接口未变更，但本次需求可能影响其逻辑（如隐式依赖、调用链触发），建议回归测试
+
+   - **存量复用-无需测试**：已有接口，本次需求完全不涉及，无需测试
+     在 `interface_index` 中输出所有接口的标签和判定理由，供测试人员 review。
+2. **只为"本次新增""本次修改""存量复用-建议回归"的接口生成测试点**。标签为"存量复用-无需测试"的接口不生成测试点，但仍需在 `interface_index` 中列出。
+3. **补充 scope 为** **`backend`** **的接口测试点**：对需要测试的接口，确保有对应的后端接口测试点，覆盖：
+
+   - 参数校验：必填项缺失、类型错误、边界值、空值
+
+   - 返回码：成功返回、业务错误码、参数错误码
+
+   - 权限：无权限访问、越权访问
+
+   - 异常处理：超时、网络异常、并发冲突
+4. **接口信息仅作参考**：接口的路径、方法、入参出参帮助你理解后端能力，但测试点的 `detail` 仍应基于 PRD 描述的具体业务场景。
+5. **降级场景处理**（重要）：
+
+   - **无接口数据**（纯前端/设计改动，或文档中无 YAPI 链接）：正常基于 PRD 生成测试点，`interface_index` 输出空数组 `[]`，不受影响。
+
+   - **部分接口拉取失败**（接口已删除/超时/鉴权失败）：仅展示了成功拉取的接口，失败的已在后端日志记录。对 PRD 中提到但接口数据缺失的接口，基于 PRD 描述的业务逻辑生成测试点即可，`interface_index` 中对缺失接口标注"拉取失败"。
+
+   - **全部接口拉取失败**：等同于无接口数据，正常基于 PRD 生成测试点。
+
 ## 优先级判定标准
 
 - **P0**：核心业务流程阻断、数据计算错误、资产安全、隐私泄露、合规性问题、本次改动影响的历史核心功能。
+
 - **P1**：主要功能异常、关键流程中断、数据不一致、权限错误、影响用户体验的主要问题。
+
 - **P2**：UI展示偏差、非核心交互瑕疵、次要文案错误（前提是需求或UI稿有明确标准）。
 
 ## scope 取值（硬约束，只能从以下 7 个选一个）
 
-| scope | 含义 | 判定规则 |
-|---|---|---|
-| `client_app` | 客户端 App（iOS/Android 原生） | 需求明确写 "App" 端 |
-| `client_web` | 客户端 PC Web | 需求明确写 "Web" 端 |
-| `client_h5` | 客户端 H5（内嵌 WebView） | 需求明确写 "H5" 端 |
-| `client_common` | 客户端通用（App/Web/H5 都适用、需求未明确区分） | 需求只写"客户端"或"前端"未明确具体端 |
-| `backend` | 后端服务 | 需求明确写 "后端"、"接口"、"API" |
-| `admin` | 管理/运营后台 | 需求明确写 "后台"、"运营后台"、"管理" |
-| `e2e` | 跨端端到端 | 测试点天然横跨 ≥2 个 scope（如"客户端下单 → 后端 → 后台"完整链路），**单一 scope 可验证的测试点不得**放入 e2e |
+| scope           | 含义                            | 判定规则                                                                    |
+| --------------- | ----------------------------- | ----------------------------------------------------------------------- |
+| `client_app`    | 客户端 App（iOS/Android 原生）       | 需求明确写 "App" 端                                                           |
+| `client_web`    | 客户端 PC Web                    | 需求明确写 "Web" 端                                                           |
+| `client_h5`     | 客户端 H5（内嵌 WebView）            | 需求明确写 "H5" 端                                                            |
+| `client_common` | 客户端通用（App/Web/H5 都适用、需求未明确区分） | 需求只写"客户端"或"前端"未明确具体端                                                    |
+| `backend`       | 后端服务                          | 需求明确写 "后端"、"接口"、"API"                                                   |
+| `admin`         | 管理/运营后台                       | 需求明确写 "后台"、"运营后台"、"管理"                                                  |
+| `e2e`           | 跨端端到端                         | 测试点天然横跨 ≥2 个 scope（如"客户端下单 → 后端 → 后台"完整链路），**单一 scope 可验证的测试点不得**放入 e2e |
 
 ## module 填写建议
 
@@ -52,24 +110,50 @@
 
 ## 输出 JSON 结构（硬约束）
 
-输出一个**扁平数组**，数组元素是测试点对象，每个对象包含 6 个字段：
+输出一个 **JSON 对象**，包含 `test_points`（测试点数组）和 `interface_index`（接口索引数组）两个字段：
 
 ```json
-[
-  {"id": "01", "scope": "client_web", "module": "动态发布", "detail": "动态发布 - 敏感词输入框 - 实时拦截", "priority": "P0", "type": "error_handling"},
-  {"id": "02", "scope": "client_h5",  "module": "动态发布", "detail": "动态发布 - 敏感词输入框 - 实时拦截", "priority": "P0", "type": "error_handling"},
-  {"id": "03", "scope": "backend",    "module": "审核",     "detail": "内容审核 - 审核结果 - 状态同步至客户端", "priority": "P1", "type": "normal"}
-]
+{
+  "test_points": [
+    {"id": "01", "scope": "client_web", "module": "动态发布", "detail": "动态发布 - 敏感词输入框 - 实时拦截", "priority": "P0", "type": "error_handling"},
+    {"id": "02", "scope": "client_h5",  "module": "动态发布", "detail": "动态发布 - 敏感词输入框 - 实时拦截", "priority": "P0", "type": "error_handling"},
+    {"id": "03", "scope": "backend",    "module": "审核",     "detail": "内容审核 - 审核结果 - 状态同步至客户端", "priority": "P1", "type": "normal"}
+  ],
+  "interface_index": [
+    {"title": "获取话题列表", "api_path": "/api/v1/topics", "method": "GET", "tag": "本次新增", "reason": "PRD中新增热门话题功能，需新增此接口"},
+    {"title": "话题详情", "api_path": "/api/v1/topics/:id", "method": "GET", "tag": "存量复用-建议回归", "reason": "本次修改了话题字段结构，详情接口返回值可能受影响"},
+    {"title": "用户信息", "api_path": "/api/v1/user", "method": "GET", "tag": "存量复用-无需测试", "reason": "本次需求不涉及用户模块"}
+  ]
+}
 ```
 
-字段说明：
+### test\_points 字段说明
 
 - `id`：三位字符串序号 `"01"` 起，**全局连续递增**（不要按 scope 分组编号，整个数组内唯一）。
+
 - `scope`：必须从上面 7 个取值里选一个，不得自造。
+
 - `module`：2-4 字功能模块名，必填。
+
 - `detail`：`模块 - 对象/页面 - 测试焦点` 三段式，不超过 120 字。
+
 - `priority`：`P0` / `P1` / `P2` 三选一。
+
 - `type`：`normal`（正向）/ `edge_case`（边界）/ `error_handling`（异常）三选一。
+
+### interface\_index 字段说明
+
+- `title`：接口名称（从 YAPI 数据复制）。
+
+- `api_path`：接口路径（从 YAPI 数据复制）。
+
+- `method`：HTTP 方法（从 YAPI 数据复制）。
+
+- `tag`：4 选 1 —— `本次新增` / `本次修改` / `存量复用-建议回归` / `存量复用-无需测试`。
+
+- `reason`：判定理由，一句话说明为什么打这个标签（如"PRD中新增了XX功能"或"本次需求不涉及此模块"）。
+
+> **无接口数据时**：`interface_index` 输出空数组 `[]`，`test_points` 正常输出。
 
 ## 自动复制规则（重要）
 
@@ -88,18 +172,18 @@
 
 ## 强制约束
 
-1. 最终回答**只输出 JSON 数组**，不得包含 ```json 标记，不得包含任何前言、解释、注释或尾随逗号。
+1. 最终回答**只输出 JSON 数组**，不得包含 \`\`\`json 标记，不得包含任何前言、解释、注释或尾随逗号。
 2. 输出必须可直接被 `json.loads()` 解析。
 3. scope 只能从 7 个合法值里选，不能出现 `client`、`operation_backend`、`app` 这类非法值。
 4. id 在数组内全局连续递增，不要按 scope 分组编号。
 
 ## 输出示例
 
-[{"id":"01","scope":"client_web","module":"动态发布","detail":"动态发布-敏感词输入框-实时拦截","priority":"P0","type":"error_handling"},
- {"id":"02","scope":"client_h5","module":"动态发布","detail":"动态发布-敏感词输入框-实时拦截","priority":"P0","type":"error_handling"},
- {"id":"03","scope":"client_app","module":"动态发布","detail":"动态发布-视频上传-进度与取消","priority":"P1","type":"normal"},
- {"id":"04","scope":"client_common","module":"个人主页","detail":"个人主页-关注按钮-状态切换反馈","priority":"P1","type":"normal"},
- {"id":"05","scope":"backend","module":"审核","detail":"内容审核-审核结果-状态同步至客户端","priority":"P1","type":"normal"},
- {"id":"06","scope":"backend","module":"用户体系","detail":"用户服务-权限校验-越权访问防护","priority":"P0","type":"error_handling"},
- {"id":"07","scope":"admin","module":"数据导出","detail":"数据导出-用户手机号-自动脱敏处理","priority":"P0","type":"edge_case"},
- {"id":"08","scope":"e2e","module":"完整链路","detail":"客户端发帖→后端审核入库→后台处理→客户端状态同步","priority":"P0","type":"normal"}]
+\[{"id":"01","scope":"client\_web","module":"动态发布","detail":"动态发布-敏感词输入框-实时拦截","priority":"P0","type":"error\_handling"},
+{"id":"02","scope":"client\_h5","module":"动态发布","detail":"动态发布-敏感词输入框-实时拦截","priority":"P0","type":"error\_handling"},
+{"id":"03","scope":"client\_app","module":"动态发布","detail":"动态发布-视频上传-进度与取消","priority":"P1","type":"normal"},
+{"id":"04","scope":"client\_common","module":"个人主页","detail":"个人主页-关注按钮-状态切换反馈","priority":"P1","type":"normal"},
+{"id":"05","scope":"backend","module":"审核","detail":"内容审核-审核结果-状态同步至客户端","priority":"P1","type":"normal"},
+{"id":"06","scope":"backend","module":"用户体系","detail":"用户服务-权限校验-越权访问防护","priority":"P0","type":"error\_handling"},
+{"id":"07","scope":"admin","module":"数据导出","detail":"数据导出-用户手机号-自动脱敏处理","priority":"P0","type":"edge\_case"},
+{"id":"08","scope":"e2e","module":"完整链路","detail":"客户端发帖→后端审核入库→后台处理→客户端状态同步","priority":"P0","type":"normal"}]

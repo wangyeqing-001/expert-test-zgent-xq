@@ -107,7 +107,7 @@ class RequirementAnalyzer(BaseAgent):
                     related_urls = self.feishu_client.get_related_doc_urls(token, dtype)
                 except Exception as e:
                     print(f"[RequirementAnalyzer] 提取关联文档URL失败: {e}")
-            raw = self._extract_and_merge_related_docs(raw, related_urls)
+            raw, _related_yapi = self._extract_and_merge_related_docs(raw, related_urls)
             markdown, blocks = self._analyze_prd_content(raw)
             local_path, feishu_url_out = self._save_and_publish(markdown, doc_title, blocks)
 
@@ -148,11 +148,20 @@ class RequirementAnalyzer(BaseAgent):
         if not content or not content.strip():
             raise ValueError(f"飞书文档内容为空，请检查文档权限: {doc_url}")
 
+        # 清洗前提取 YAPI 接口链接（清洗会删纯 URL 行，先存起来）
+        yapi_urls = self._extract_yapi_urls(content)
+        if yapi_urls:
+            print(f"[RequirementAnalyzer] 提取到 {len(yapi_urls)} 个 YAPI 接口链接")
+
         # 清洗 + 拉取关联文档（qadoc 优先，已缓存 related_urls）
         content = self._clean_doc_content(content)
         related_urls = self.feishu_client.get_related_doc_urls(doc_token, doc_type, doc_url=doc_url)
         # 收集成功拉取的关联文档（标题+URL），用于最终飞书文档尾部追加索引
-        fetched_related = self._extract_and_merge_related_docs(content, related_urls)
+        fetched_related, related_yapi_urls = self._extract_and_merge_related_docs(content, related_urls)
+        # 合并主文档 + 关联文档的 YAPI 链接（去重保序）
+        all_yapi = list(dict.fromkeys(yapi_urls + related_yapi_urls))
+        if related_yapi_urls:
+            print(f"[RequirementAnalyzer] 关联文档中提取到 {len(related_yapi_urls)} 个 YAPI 链接，合并后共 {len(all_yapi)} 个")
         # 从 merged 结果和原始 content 差异中提取关联文档索引
         related_index = self._extract_related_index(content, related_urls)
 
@@ -178,6 +187,7 @@ class RequirementAnalyzer(BaseAgent):
                 'doc_url': doc_url,
                 'doc_type': doc_type,
                 'doc_token': doc_token,
+                'yapi_urls': all_yapi,
             },
         }
 
@@ -265,7 +275,21 @@ class RequirementAnalyzer(BaseAgent):
     )
     _MENTION_LINE_RE = re.compile(r'^@[\w\u4e00-\u9fa5._\-]+$')
     _URL_LINE_RE = re.compile(r'^https?://\S+$')
+    _YAPI_URL_RE = re.compile(
+        r'https?://yapi[\w.-]*/project/\d+/interface/api(?:/\d+)?'
+    )
     _BOILERPLATE_KEYWORDS = ('Title Alpha', 'Title Beta', 'Title Ready')
+
+    def _extract_yapi_urls(self, content: str) -> list:
+        """从文档内容中提取所有 YAPI 接口链接（去重保序）"""
+        seen = set()
+        urls = []
+        for m in self._YAPI_URL_RE.finditer(content or ''):
+            url = m.group(0).rstrip('`。，,;；)')
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
 
     def _clean_doc_content(self, content: str) -> str:
         """
@@ -322,12 +346,14 @@ class RequirementAnalyzer(BaseAgent):
         """
         从文档正文中提取关联飞书文档链接，拉取内容后拼接到主文档末尾。
         只做一层抓取，不递归；单个关联文档最多 3000 字符；拉取失败不中断。
+        同时提取关联文档中的 YAPI 接口链接（清洗前提取，避免丢失）。
 
         :param content: 主文档内容（可能已被 raw_content 降级丢失 mention_doc URL）
         :param related_urls: blocks API 提取的 mention_doc URL 列表（优先使用）
+        :return: (merged_content, related_yapi_urls)  关联文档中的 YAPI 链接列表
         """
         if not self.feishu_client:
-            return content
+            return content, []
 
         # 优先用 blocks API 提取的 URL（mention_doc 不丢失）
         urls = list(related_urls or [])
@@ -343,10 +369,11 @@ class RequirementAnalyzer(BaseAgent):
                 urls.append(u)
 
         if not urls:
-            return content
+            return content, []
 
         merged_parts = [content, '\n\n---\n\n## 关联文档内容\n']
         fetched = 0
+        related_yapi_urls = []
 
         for url in urls:
             try:
@@ -357,6 +384,9 @@ class RequirementAnalyzer(BaseAgent):
                 if not doc_content or not doc_content.strip():
                     print(f"[RequirementAnalyzer] 关联文档内容为空，跳过: {url}")
                     continue
+
+                # 清洗前提取关联文档中的 YAPI 链接（清洗会删纯 URL 行）
+                related_yapi_urls.extend(self._extract_yapi_urls(doc_content))
 
                 # 清洗关联文档内容（复用已有清洗逻辑）
                 cleaned = self._clean_doc_content(doc_content)
@@ -374,10 +404,10 @@ class RequirementAnalyzer(BaseAgent):
                 continue
 
         if fetched == 0:
-            return content
+            return content, related_yapi_urls
 
         print(f"[RequirementAnalyzer] 共拉取 {fetched} 篇关联文档，已合并到主文档")
-        return '\n'.join(merged_parts)
+        return '\n'.join(merged_parts), related_yapi_urls
 
     def _extract_related_index(self, content_before: str, related_urls: list) -> list:
         """从 qadoc content 或 blocks API 提取关联文档的标题+URL 索引

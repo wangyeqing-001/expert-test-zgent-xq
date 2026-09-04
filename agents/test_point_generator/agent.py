@@ -72,6 +72,7 @@ class TestPointGenerator(BaseAgent):
         doc_title = input_data.get('title') or '测试点清单'
         source_doc_url = input_data.get('source_doc_url', '')
         analysis_doc_url = input_data.get('analysis_doc_url', '')
+        yapi_interfaces = input_data.get('yapi_interfaces', [])
         
         # 根据来源选择链路
         json_path = None
@@ -84,12 +85,14 @@ class TestPointGenerator(BaseAgent):
                 prd_text = json.dumps(requirements, ensure_ascii=False)
             # structured_constraints: None=自动跑分支A提取；显式传入则直接使用
             structured_constraints = input_data.get('structured_constraints')
-            test_points = self._extract_testpoints_from_prd(prd_text, structured_constraints)
+            test_points, interface_index = self._extract_testpoints_from_prd(prd_text, structured_constraints,
+                                                               yapi_interfaces=yapi_interfaces)
             batches = []
             if test_points:
                 local_path, feishu_url, json_path, batches = self._publish_points(
                     test_points, doc_title,
                     source_doc_url=source_doc_url, analysis_doc_url=analysis_doc_url,
+                    interface_index=interface_index,
                 )
                 scenarios = self._points_to_scenarios(test_points)  # 下游兼容（旧路径）
             else:
@@ -255,23 +258,60 @@ class TestPointGenerator(BaseAgent):
             print(f"  [约束清单] 分支A提取失败(跳过辅助材料): {type(e).__name__}: {str(e)[:100]}")
             return ''
     
-    def _extract_testpoints_from_prd(self, prd_text: str, structured_constraints: str = None) -> list:
+    def _extract_testpoints_from_prd(self, prd_text: str, structured_constraints: str = None,
+                                       yapi_interfaces: list = None):
         """按prd_to_testpoints.md直提测试点：
-        - 新路径：AI 输出扁平 JSON 数组，每条带 scope 字段 → scope 白名单 + platform 映射
-        - 老路径（fallback）：端分组嵌套 JSON dict → 按 GROUP_PLATFORM_MAP 遍历
-        :param structured_constraints: None=自动跑分支A；''=无辅助材料；其他=直接使用
+        - 新路径：AI 输出 {test_points, interface_index} 对象
+        - 老路径（fallback）：扁平数组 or 端分组 dict
+        :return: (test_points, interface_index)
         """
         if not (self.llm and prd_text):
-            return []
+            return [], []
         try:
             if structured_constraints is None:
                 structured_constraints = self._extract_constraints(prd_text)
+            # 格式化 YAPI 接口详情供 prompt 注入（标准化结构）
+            yapi_text = '（无接口数据）'
+            if yapi_interfaces:
+                yapi_lines = []
+                for i, item in enumerate(yapi_interfaces, 1):
+                    title = item.get('title', '未知')
+                    path = item.get('api_path', '未知')
+                    method = item.get('method', '未知')
+                    params = item.get('params', [])
+                    res_schema = item.get('response_schema', '')
+                    desc = item.get('desc', '')
+
+                    # 入参摘要
+                    param_parts = []
+                    for p in params:
+                        req_tag = '必填' if p.get('required') else '可选'
+                        param_parts.append(
+                            f"  - {p.get('name', '?')} ({p.get('type', 'string')}, {req_tag}): {p.get('desc', '')}"
+                        )
+                    param_text = '\n'.join(param_parts) if param_parts else '  （无入参定义）'
+
+                    # 出参摘要（截断）
+                    res_text = res_schema[:800] if res_schema else '（无出参定义）'
+
+                    yapi_lines.append(
+                        f"### 接口{i}: {title}\n"
+                        f"- 路径: {method} {path}\n"
+                        f"- 描述: {desc}\n"
+                        f"- 入参:\n{param_text}\n"
+                        f"- 出参:\n  {res_text}\n"
+                        f"- 变更类型: 待分析\n"
+                        f"- 关联需求: 待分析"
+                    )
+                yapi_text = '\n\n'.join(yapi_lines)
+                # 注：部分接口拉取失败时，仅展示成功项，失败的已在后端日志记录
             prompt = build_prompt(_DIR, 'prd_to_testpoints.md',
                 prd_requirements=prd_text[:12000],
-                structured_constraints=(structured_constraints or '（无辅助材料）')[:4000])
+                structured_constraints=(structured_constraints or '（无辅助材料）')[:4000],
+                yapi_interfaces=yapi_text[:6000])
             response = self.llm.generate(prompt, max_tokens=16000)
 
-            parsed = self._parse_llm_json(response)
+            parsed, interface_index = self._parse_llm_json(response)
             points = []
             if isinstance(parsed, list):
                 # ===== 新：扁平数组路径 =====
@@ -281,40 +321,64 @@ class TestPointGenerator(BaseAgent):
                 points = self._grouped_dict_to_points(parsed)
 
             if not points:
-                return []
+                return [], interface_index
             # 统一重新编号（保证 01 连续递增，防 LLM 漏号/重复）
             for i, p in enumerate(points, 1):
                 p['id'] = f'{i:02d}'
             if points:
                 print(f"✓ [TestPointGenerator] prd直提 {len(points)} 个测试点")
-            return points
+            if interface_index:
+                print(f"✓ [TestPointGenerator] 接口索引 {len(interface_index)} 条")
+            return points, interface_index
         except Exception as e:
             print(f"⚠ [TestPointGenerator] prd直提异常: {type(e).__name__}: {str(e)[:100]}")
-            return []
+            return [], []
 
     def _parse_llm_json(self, text: str):
-        """统一解析 LLM 输出 JSON，自动判断扁平数组 or 嵌套 dict"""
+        """统一解析 LLM 输出 JSON
+        支持三种格式：
+        1. 新格式对象: {"test_points": [...], "interface_index": [...]}
+        2. 老格式扁平数组: [{id, scope, ...}, ...]
+        3. 老格式嵌套 dict: {"client": {"app": [...]}, ...}
+        返回: (parsed_data, interface_index)
+        """
         cleaned = re.sub(r'```(?:json)?\s*', '', text or '')
         cleaned = re.sub(r'```', '', cleaned).strip()
-        # 优先数组：找最外层 [...]
-        arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        # 尝试提取 JSON 片段（对象 or 数组）
+        # 对象优先（新格式 {"test_points": ...}），数组次之（老格式扁平 [...]）
         obj_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        # 构建候选列表，对象在前
         candidates = []
-        if arr_match: candidates.append(arr_match.group(0))
         if obj_match: candidates.append(obj_match.group(0))
+        if arr_match: candidates.append(arr_match.group(0))
         if not candidates:
-            return None
+            return None, []
         for s in candidates:
             try:
-                return json.loads(s)
+                data = json.loads(s)
             except json.JSONDecodeError:
                 fixed = re.sub(r',\s*([}\]])', r'\1', s)
                 try:
-                    return json.loads(fixed)
+                    data = json.loads(fixed)
                 except json.JSONDecodeError:
                     continue
+            # 新格式：对象含 test_points
+            if isinstance(data, dict) and 'test_points' in data:
+                idx = data.get('interface_index') or []
+                return data['test_points'], idx
+            # 老格式扁平数组
+            if isinstance(data, list):
+                return data, []
+            # 老格式嵌套 dict（如 {"client": {"app": [...]}}）
+            if isinstance(data, dict):
+                # 检查是否是嵌套 dict 格式（values 是 list）
+                if any(isinstance(v, dict) for v in data.values()):
+                    return data, []
+                # 单个测试点对象（误提取），跳过尝试下一个候选
+                continue
         print(f"⚠ [TestPointGenerator] JSON 解析失败（扁平 & 老格式均不通）")
-        return None
+        return None, []
 
     def _flatten_items_to_points(self, items: list) -> list:
         """扁平数组 → 测试点列表（scope 白名单 + 字段校验）"""
@@ -440,10 +504,12 @@ class TestPointGenerator(BaseAgent):
         return batches
 
     def _publish_points(self, test_points: list, title: str,
-                        source_doc_url: str = '', analysis_doc_url: str = '') -> tuple:
+                        source_doc_url: str = '', analysis_doc_url: str = '',
+                        interface_index: list = None) -> tuple:
         """直提链路发布：按端分组多个表格（不暴露批次）+ JSON落盘(含batches) + 本地.md
         :param source_doc_url: 原始需求文档飞书链接（写进正文供溯源）
         :param analysis_doc_url: 需求分析飞书链接（写进正文供溯源）
+        :param interface_index: AI 标注的接口索引（4类标签，供测试人员 review）
         :return: (local_path, feishu_url, json_path, batches)
         """
         batches = self._split_into_batches(test_points)
@@ -477,6 +543,16 @@ class TestPointGenerator(BaseAgent):
                     for i, p in enumerate(pts)]
             struct_nodes.append({'type': 'h2', 'text': f"{label}（{len(pts)}个）"})
             struct_nodes.append({'type': 'table', 'headers': HEADERS, 'rows': rows})
+        # 接口索引表（供测试人员 review AI 标签）
+        if interface_index:
+            IF_HEADERS = ['接口名称', '路径', '方法', '标签', '判定理由']
+            if_rows = [
+                [it.get('title', ''), it.get('api_path', ''), it.get('method', ''),
+                 it.get('tag', ''), it.get('reason', '')]
+                for it in interface_index
+            ]
+            struct_nodes.append({'type': 'h2', 'text': f"接口索引（{len(interface_index)}个，请 review）"})
+            struct_nodes.append({'type': 'table', 'headers': IF_HEADERS, 'rows': if_rows})
         md = struct_to_markdown(struct_nodes)
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -489,7 +565,8 @@ class TestPointGenerator(BaseAgent):
         json_path = os.path.join(self.output_dir, f"{safe_title}_{timestamp}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump({'title': title, 'total': len(test_points), 'batches': batches,
-                       'test_points': test_points},  # 扁平列表保留，向后兼容
+                       'test_points': test_points,  # 扁平列表保留，向后兼容
+                       'interface_index': interface_index or []},
                       f, ensure_ascii=False, indent=2)
         print(f"✓ [TestPointGenerator] 测试点JSON保存({len(test_points)}条/{len(batches)}批): {json_path}")
 
