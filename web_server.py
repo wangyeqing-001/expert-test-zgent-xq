@@ -73,10 +73,12 @@ from core.llm_client import LLMClient
 api_key = os.getenv('DASHSCOPE_API_KEY') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_API_KEY')
 if os.getenv('DASHSCOPE_API_KEY'):
     base_url = os.getenv('DASHSCOPE_BASE_URL')
-elif api_key == os.getenv('DEEPSEEK_API_KEY'):
+elif os.getenv('DEEPSEEK_API_KEY'):
     base_url = os.getenv('DEEPSEEK_BASE_URL')
-else:
+elif os.getenv('OPENAI_API_KEY'):
     base_url = os.getenv('OPENAI_BASE_URL')
+else:
+    base_url = None
 
 # 初始化飞书客户端（可选）
 feishu_app_id = os.getenv('FEISHU_APP_ID')
@@ -198,34 +200,24 @@ def _normalize_yapi_interface(yapi_url: str, raw: dict) -> dict:
         'related_requirement': '',
     }
 
-def _fetch_yapi_interfaces(yapi_urls: list) -> list:
-    """批量拉取 YAPI 接口详情并标准化"""
-    if not yapi_urls:
-        return []
-    results = []
-    for url in yapi_urls:
-        raw = _fetch_yapi_interface(url)
-        if raw:
-            results.append(_normalize_yapi_interface(url, raw))
-    logger.info(f"YAPI 接口拉取完成: {len(results)}/{len(yapi_urls)} 成功")
-    return results
-
 # ---- 需求分析历史记录持久化（供前端 /api/history 拉取展示可点击链接）----
 HISTORY_FILE = os.path.join('generated_requirements', 'history.json')
+_history_lock = threading.Lock()
 
 
 def _append_history(record: dict):
     """追加一条需求分析历史记录到 JSON 文件（最新在前，最多保留100条）"""
     try:
-        items = []
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                items = json.load(f)
-        items.insert(0, record)
-        items = items[:100]
-        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
+        with _history_lock:
+            items = []
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    items = json.load(f)
+            items.insert(0, record)
+            items = items[:100]
+            os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(items, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"写入历史记录失败: {e}")
 
@@ -289,8 +281,8 @@ def analyze_requirement():
         return jsonify({
             'success': True,
             'task_id': task_id,
-            'markdown': result['markdown'],
-            'local_path': result['local_path'],
+            'markdown': result.get('markdown', ''),
+            'local_path': result.get('local_path', ''),
             'feishu_url': result.get('feishu_url'),
             'metadata': result.get('metadata', {})
         })
@@ -317,11 +309,13 @@ def generate_test_points():
             req_md_text = ''
             req_title = ''
             yapi_urls = []
+            matched_item = None
             try:
                 with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
                     items = json.load(f)
                 for it in items:
                     if it.get('task_id') == task_id or task_id in it.get('local_path', ''):
+                        matched_item = it
                         local_path = it.get('local_path', '')
                         if local_path and os.path.exists(local_path):
                             with open(local_path, 'r', encoding='utf-8') as f:
@@ -344,8 +338,8 @@ def generate_test_points():
                     'source': 'prd',
                     'raw_prd': req_md_text,
                     'title': req_title,
-                    'source_doc_url': it.get('source_doc_url', ''),
-                    'analysis_doc_url': it.get('feishu_url', ''),
+                    'source_doc_url': matched_item.get('source_doc_url', '') if matched_item else '',
+                    'analysis_doc_url': matched_item.get('feishu_url', '') if matched_item else '',
                     'yapi_interfaces': yapi_interfaces,
                 })
             return jsonify({
@@ -476,6 +470,7 @@ def generate_test():
                             'platform': batch.get('platform', ''),
                             'platform_label': batch.get('platform_label', ''),
                             'batch_index': batch.get('batch_index', 1),
+                            'feishu_url': result.get('feishu_url', ''),
                         })
                     except Exception as e:
                         logger.error(f"batch生成失败 [{batch.get('platform', '')}-{batch.get('batch_index', 1)}]: {e}")
@@ -586,11 +581,11 @@ def run_pipeline():
         if query and not file_path:
             # 自然语言模式：先做需求分析
             requirement_result = req_agent.process_query(query)
-            logger.info(f"需求分析完成: local={requirement_result['local_path']}, feishu={requirement_result.get('feishu_url')}")
-            
+            logger.info(f"需求分析完成: local={requirement_result.get('local_path')}, feishu={requirement_result.get('feishu_url')}")
+
             # 从markdown提取结构化需求
             from agents.orchestrator.agent import AgentOrchestrator as Orch
-            requirements = Orch._extract_requirements(requirement_result['markdown'])
+            requirements = Orch._extract_requirements(requirement_result.get('markdown', ''))
         
         if file_path:
             # 文件模式：用编排器跑完整3步流水线

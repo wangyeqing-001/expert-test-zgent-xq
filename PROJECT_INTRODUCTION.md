@@ -18,8 +18,10 @@
 - **全端测试覆盖**：客户端 App (Appium)、Web/H5 (Playwright)、后端服务 (requests+pytest)、管理后台 (Playwright)、跨端 E2E (Playwright+requests)
 - **多渠道接入**：CLI交互式 + Web图形界面 + 飞书机器人对话 + 飞书链接独立脚本（均为Agent调用渠道）
 - **Web 体验优化**：实时日志面板（增量轮询展示）、分析期间按钮置灰防重复提交、需求分析历史记录（持久化原始文档链接+生成飞书文档链接+任务ID，分页加载：默认3条+每次加载更多5条，可点击回溯）
+- **YAPI 接口数据集成**：需求分析阶段从主文档+关联文档中提取 YAPI 链接（清洗前提取，不丢失），绑定 task_id 存入 history.json；测试点生成时通过内部接口 `getInterfaceData` 拉取接口详情（路径/方法/入参/出参），标准化映射后注入 prompt，AI 为每个接口打标签（本次新增/修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review
 - **飞书日志上下文标注**：日志区分"主文档"与"关联文档"拉取，关联文档失败自动降级为WARNING并跳过（不影响主文档分析）
-- **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性
+- **测试用例飞书按端分类**：生成的测试用例自动上传到对应端飞书文件夹（客户端/后台/后端各一个），文档标题含端标识+批次序号+时间戳
+- **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性；YAPI 接口拉取失败（404/鉴权/超时）自动跳过不阻塞，无接口数据时 AI 仅基于 PRD 正常工作
 
 ---
 
@@ -156,11 +158,14 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
 链路1：prd直提（source='prd'，需求来自PRD/飞书文档）
   原始PRD全文（主材料，唯一事实来源）
     ├→ 分支A：constraints_extract.md 提取约束清单（防遗漏索引）
-    └→ 主流程：prd_to_testpoints.md（辅助材料注入门控：不作事实来源/无视推测/冲突以PRD为准）
-      ↓ 一次LLM直出扁平JSON数组（每条含 scope 字段，7选1：client_app/web/h5/common、backend、admin、e2e）
+    └→ 主流程：prd_to_testpoints.md
+        辅助材料注入门控：不作事实来源/无视推测/冲突以PRD为准
+        YAPI 接口数据注入（标准化结构：api_path/method/params/response_schema）
+        AI 为每个接口打4类标签（新增/修改/复用-回归/复用-无需测试），不丢弃
+      ↓ 一次LLM直出 JSON 对象 {test_points: [...], interface_index: [...]}
       ↓ 代码按 _SCOPE_PLATFORM_MAP 白名单映射 scope→platform + 非法scope跳过
       ↓ _split_into_batches：同端内按 max_per_batch 切批 → List[TestBatch]
-      ↓ _publish_points：飞书文档正文（溯源链接 + 概述 + 按端H2分节表格），不二次调LLM
+      ↓ _publish_points：飞书文档正文（溯源链接 + 概述 + 按端H2分节表格 + 接口索引表），不二次调LLM
 
 链路2：code分析（source='code'，降级路径）
   _generate_by_rules 规则生成scenarios → _save_and_publish_table 确定性渲染
@@ -168,8 +173,9 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
 
 **统一产出（两条链路同格式）**：
 - **测试点JSON**：`{id, endpoint, platform, scope, module, detail, priority, source, type}`，落盘 `generated_testpoints/{标题}_{时间戳}.json`
+- **接口索引**：`{title, api_path, method, tag, reason}`，4类标签供测试人员 review，飞书文档末尾追加5列原生表格
 - **TestBatch 结构**：`{platform, platform_label, batch_index, priority, shared_context:{framework,assertion_focus}, test_points[], depends_on[]}`，同端内按可配置 `max_per_batch` 切批（app/web/h5/common=8、backend=12、admin=10、e2e=6），priority 取批内最高
-- **飞书文档**：正文顶部含2行溯源链接（需求文档+需求分析，飞书原生超链接），概述段（总数/P0数/各端分布），按端 H2 分节 + 原生表格（每端序号从1开始）；本地.md同步保存
+- **飞书文档**：正文顶部含2行溯源链接（需求文档+需求分析，飞书原生超链接），概述段（总数/P0数/各端分布），按端 H2 分节 + 原生表格（每端序号从1开始），末尾接口索引表（5列：名称/路径/方法/标签/理由）；本地.md同步保存
 - 降级：prd直提失败时降级规则生成 + 确定性表格渲染，产出不断
 
 **关键方法**：
@@ -178,7 +184,7 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
 
 ### 4. TestGeneratorAgent（测试生成Agent）
 
-**职责**：根据测试点批次生成可执行的测试代码，按 platform 路由 3 类 prompt
+**职责**：根据测试点批次生成可执行的测试代码，按 platform 路由 3 类 prompt，生成后按端上传到对应飞书文件夹
 
 **工作流程**：
 ```
@@ -192,10 +198,21 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
   ↓
 LLM生成 Python 测试代码（强制 ```python``` 标记 + 语法校验）
   ↓
-保存到 generated_tests/
+保存到 generated_tests/（本地 .py 文件）
   ↓
-输出：test_case + file_path
+按 platform 查 _PLATFORM_FOLDER_MAP 路由飞书文件夹 → create_doc 上传
+  ↓
+输出：test_case + file_path + feishu_url
 ```
+
+**飞书测试用例文件夹路由**：
+| platform | 飞书文件夹 | 环境变量 |
+|---|---|---|
+| app / web / h5 / common / e2e | 客户端测试用例文件夹 | `FEISHU_TEST_FOLDER_CLIENT` |
+| backend | 后端测试用例文件夹 | `FEISHU_TEST_FOLDER_BACKEND` |
+| admin | 后台测试用例文件夹 | `FEISHU_TEST_FOLDER_ADMIN` |
+
+飞书上传失败不阻塞测试生成（返回空串，本地文件已保存）。
 
 **3 类 prompt 路由表**：
 | platform | prompt 文件 | framework | 断言重点 |
@@ -443,6 +460,15 @@ Content-Type: application/json
 POST /api/generate
 Content-Type: application/json
 
+# 模式A：task_id（推荐，从测试点JSON加载batches逐批生成）
+{
+  "task_id": "REQ-20260904-101235"
+}
+# → 从 history.json 查找测试点JSON → 加载batches → execute_batch逐批生成
+# → 按platform路由prompt + 上传到对应端飞书文件夹
+# → 返回 {generated_files, test_files(含feishu_url), total_batches}
+
+# 模式B：自然语言（老路径）
 {
   "query": "补充说明（可选）",
   "requirement_doc": "需求文档内容",
@@ -634,7 +660,11 @@ LLM_MODEL=gpt-4
 # 飞书配置
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
-FEISHU_OUTPUT_FOLDER=your_folder_token
+FEISHU_OUTPUT_FOLDER=your_folder_token         # 需求分析文档目录
+FEISHU_TESTPOINT_FOLDER=your_folder_token       # 测试点文档目录
+FEISHU_TEST_FOLDER_CLIENT=your_folder_token     # 客户端测试用例目录
+FEISHU_TEST_FOLDER_ADMIN=your_folder_token      # 后台测试用例目录
+FEISHU_TEST_FOLDER_BACKEND=your_folder_token    # 后端测试用例目录
 FEISHU_DOMAIN=your_company.feishu.cn
 
 # 记忆文件存储目录（默认 memory_data/）
@@ -680,12 +710,14 @@ LLM调用成功 → 智能生成高质量代码
 - `base_url` 全链路传递，无缝切换不同模型
 
 ### 6. 飞书文档集成 + 机器人交互
-- 需求分析与测试点均自动写入飞书文档，支持在线协作评审
+- **飞书文档集成 + 机器人交互**
+- 需求分析、测试点、测试用例均自动写入飞书文档，支持在线协作评审
 - **struct直写原生块**：业务JSON ↔ structured_doc模型 ↔ 飞书原生块，无Markdown解析损耗；h1-h3/段落/列表/表格/code 8种节点
 - **markdown超链接解析**：`_parse_inline` 支持 `[text](url)` → 飞书原生 `text_element_style.link`，测试点文档溯源链接可点击
 - **日志上下文标注**：飞书 API 调用日志区分 `[主文档]` 与 `[关联文档]`，关联文档失败自动降级为 WARNING（不影响主文档分析）
+- **测试用例按端分类上传**：3 个飞书文件夹（客户端/后台/后端），由 `_PLATFORM_FOLDER_MAP` 按 platform 自动路由
 - 表格对齐规则（CJK宽度）与表格宽度自适应（列数×平均列宽≤页面宽度才设width，防横向溢出）在Agent侧确定性生成
-- 通过 `FEISHU_OUTPUT_FOLDER` / `FEISHU_TESTPOINT_FOLDER` 环境变量分别指定需求分析与测试点目标文件夹
+- 通过 `FEISHU_OUTPUT_FOLDER` / `FEISHU_TESTPOINT_FOLDER` / `FEISHU_TEST_FOLDER_*` 环境变量分别指定需求分析、测试点、测试用例目标文件夹
 - 飞书域名通过 `FEISHU_DOMAIN` 环境变量配置（默认 `xueqiu.feishu.cn`）
 - `access_token` 自动过期刷新（提前60秒续期，避免长时间运行后失效）
 - 飞书机器人支持自然语言对话，自动识别意图调用对应Agent
@@ -703,18 +735,26 @@ LLM调用成功 → 智能生成高质量代码
 - **门控指令**：辅助材料不作事实来源、无视"推荐默认值/置信度"等推测性内容、冲突以PRD为准
 - 效果：降低幻觉，兼顾覆盖率与可解释性
 
+### 9. YAPI 接口数据集成
+- **链接提取**：文档清洗前从主文档+关联文档中提取 YAPI URL（正则匹配 `yapi.*\/project\/\d+\/interface\/api(\/\d+)?`），去重存入 metadata.yapi_urls
+- **接口详情拉取**：通过内部接口 `https://ugcqams.snowballfinance.com/internal/getInterfaceData?interfaceYapiId=xxx` 获取接口完整定义
+- **标准化映射层**：`_normalize_yapi_interface()` 将 YAPI 原始响应转为统一结构 `{api_path, method, title, params, response_schema, desc, change_type, related_requirement}`，后两个字段留空待 AI 分析
+- **AI 接口打标**：4 类标签（本次新增/本次修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review
+- **异常降级**：404(已删除)/401,403(鉴权)/Timeout 分别记录 WARNING，部分失败跳过不阻塞，无接口数据时 AI 仅基于 PRD 正常工作
+
 ---
 
 ## 📊 项目统计
 
-- **代码行数**：约 3500+ 行
+- **代码行数**：约 3800+ 行
 - **核心模块**：5个Agent + 8个核心组件
-- **Prompt 文件**：测试点 3 个（prd_to_testpoints / constraints_extract）+ 测试用例 3 类（client / admin / backend）
-- **支持测试类型**：3种（Web/Mobile/API）
+- **Prompt 文件**：测试点 2 个（prd_to_testpoints / constraints_extract）+ 测试用例 3 类（client / admin / backend）
+- **支持测试类型**：7 端（App/Web/H5/通用/E2E/后端/管理后台），3 类 prompt 路由
 - **支持LLM提供商**：3种（百炼DashScope/DeepSeek/OpenAI）
 - **交互方式**：4种（CLI/Web/飞书机器人/飞书链接独立脚本）
-- **飞书集成**：需求分析 + 测试点双文档自动写入（含溯源链接）+ 飞书机器人对话 + Web历史记录分页+任务ID
-- **测试点产出**：按端分节表格（飞书原生表格 + 溯源链接）+ 九字段JSON + TestBatch批次落盘，双链路统一
+- **飞书集成**：需求分析 + 测试点 + 测试用例三类文档自动写入（测试用例按端分3个文件夹）+ 飞书机器人对话 + Web历史记录分页+任务ID
+- **测试点产出**：按端分节表格（飞书原生表格 + 溯源链接）+ 接口索引表（4类标签review）+ 九字段JSON + TestBatch批次落盘，双链路统一
+- **YAPI 集成**：主文档+关联文档 YAPI 链接提取 → 内部接口拉取详情 → 标准化映射 → AI 打标 → 接口索引表
 
 ---
 
