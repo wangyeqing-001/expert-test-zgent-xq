@@ -69,6 +69,8 @@ class TestPointGenerator(BaseAgent):
         test_type = input_data.get('test_type', 'web')
         source = input_data.get('source', 'code')  # 'code' or 'prd'
         doc_title = input_data.get('title') or '测试点清单'
+        source_doc_url = input_data.get('source_doc_url', '')
+        analysis_doc_url = input_data.get('analysis_doc_url', '')
         
         # 根据来源选择链路
         json_path = None
@@ -84,7 +86,10 @@ class TestPointGenerator(BaseAgent):
             test_points = self._extract_testpoints_from_prd(prd_text, structured_constraints)
             batches = []
             if test_points:
-                local_path, feishu_url, json_path, batches = self._publish_points(test_points, doc_title)
+                local_path, feishu_url, json_path, batches = self._publish_points(
+                    test_points, doc_title,
+                    source_doc_url=source_doc_url, analysis_doc_url=analysis_doc_url,
+                )
                 scenarios = self._points_to_scenarios(test_points)  # 下游兼容（旧路径）
             else:
                 print("  [测试点] prd直提失败, 降级规则生成 + 阶段2表格链路")
@@ -191,15 +196,16 @@ class TestPointGenerator(BaseAgent):
     # ---------- prd直提链路（扁平JSON → scope → platform 分组 + 同端内分批 TestBatch） ----------
 
     # scope(AI输出) → platform(内部路由键) → (label, max_per_batch, prompt文件, framework, assertion_focus)
-    # scope 是 AI 必须输出的 7 选 1 取值；platform 是下游 TestGenerator 路由 prompt 用的英文键（保持稳定）
+    # prompt 文件合并为 3 类：client_test.md（客户端含 App/Web/H5/通用/E2E）/ admin_test.md（管理后台）/ backend_test.md（后端服务）
+    # framework 和 assertion_focus 保留细粒度差异，prompt 内按参数自动适配
     _PLATFORM_CONFIG = {
-        'app':     ('客户端-App',  8,  'app_test.md',     'Appium',              '页面元素/交互流程/视觉状态'),
-        'web':     ('客户端-Web',  8,  'web_test.md',     'Playwright',          '页面导航/元素定位/显式等待'),
-        'h5':      ('客户端-H5',   8,  'h5_test.md',      'Playwright',          'WebView兼容/页面适配/交互'),
-        'common':  ('客户端-通用', 8,  'common_test.md',  'Playwright/Appium',   'UI交互/状态反馈/兼容性'),
+        'app':     ('客户端-App',  8,  'client_test.md', 'Appium',              '页面元素/交互流程/视觉状态'),
+        'web':     ('客户端-Web',  8,  'client_test.md', 'Playwright',          '页面导航/元素定位/显式等待'),
+        'h5':      ('客户端-H5',   8,  'client_test.md', 'Playwright',          'WebView兼容/页面适配/交互'),
+        'common':  ('客户端-通用', 8,  'client_test.md', 'Playwright/Appium',   'UI交互/状态反馈/兼容性'),
         'backend': ('后端服务',    12, 'backend_test.md', 'requests+pytest',     '接口返回码/数据字段/数据库状态'),
         'admin':   ('管理后台',    10, 'admin_test.md',   'Playwright',          '页面功能/权限控制/表单校验'),
-        'e2e':     ('端到端集成',   6,  'e2e_test.md',     'Playwright+requests', '跨端流程/数据流转/状态同步'),
+        'e2e':     ('端到端集成',   6,  'client_test.md',  'Playwright+requests', '跨端流程/数据流转/状态同步'),
     }
 
     # ===== 新：扁平 JSON 模式 =====
@@ -428,25 +434,43 @@ class TestPointGenerator(BaseAgent):
                 })
         return batches
 
-    def _publish_points(self, test_points: list, title: str) -> tuple:
-        """直提链路发布：子端分组 + 同端内分批 → 本地.md + JSON落盘(含batches) + 飞书(按端分节原生表格)
+    def _publish_points(self, test_points: list, title: str,
+                        source_doc_url: str = '', analysis_doc_url: str = '') -> tuple:
+        """直提链路发布：按端分组多个表格（不暴露批次）+ JSON落盘(含batches) + 本地.md
+        :param source_doc_url: 原始需求文档飞书链接（写进正文供溯源）
+        :param analysis_doc_url: 需求分析飞书链接（写进正文供溯源）
         :return: (local_path, feishu_url, json_path, batches)
         """
         batches = self._split_into_batches(test_points)
         n_p0 = sum(1 for p in test_points if p['priority'] == 'P0')
-        # 飞书 struct：按端分节，每端一个 h2 + 原生飞书表格
+        # 先按 platform 分组（端维度，不是批次维度）
+        by_platform: dict[str, list] = {}
+        for p in test_points:
+            by_platform.setdefault(p['platform'], []).append(p)
+        # 概述里展示各端数量
+        platform_counts = [f"{self._PLATFORM_CONFIG[pl][0]}({len(pts)})" for pl, pts in by_platform.items()
+                           if pl in self._PLATFORM_CONFIG]
         HEADERS = ['序号', '测试点详情', '优先级', '涉及端']
-        struct_nodes = [
-            {'type': 'h1', 'text': f'{title} - 测试点清单'},
-            {'type': 'paragraph', 'text': f'共{len(test_points)}个测试点（{len(batches)}批），其中P0 {n_p0}个。'},
-        ]
-        for b in batches:
-            rows = [[i+1, p['detail'], p['priority'], p.get('endpoint', b['platform_label'])]
-                    for i, p in enumerate(b['test_points'])]
-            struct_nodes.append({
-                'type': 'h2',
-                'text': f"{b['platform_label']} · 第{b['batch_index']}批（{len(b['test_points'])}个，最高优先级{b['priority']}）"
-            })
+        # 注意：飞书文档顶部标题栏已显示 "[测试点] {title}"，正文不再重复 H1
+        struct_nodes = []
+        # 2 行溯源链接（有值才加）
+        if source_doc_url:
+            struct_nodes.append({'type': 'paragraph',
+                'text': f'📄 需求文档：[点击查看]({source_doc_url})'})
+        if analysis_doc_url:
+            struct_nodes.append({'type': 'paragraph',
+                'text': f'✨ 需求分析：[点击查看]({analysis_doc_url})'})
+        struct_nodes.append(
+            {'type': 'paragraph', 'text': f'共{len(test_points)}个测试点（P0 {n_p0}个）。分布：' + ' · '.join(platform_counts)})
+        # 端分组顺序按 _PLATFORM_CONFIG 定义顺序，稳定可读
+        for platform, cfg in self._PLATFORM_CONFIG.items():
+            pts = by_platform.get(platform, [])
+            if not pts:
+                continue
+            label = cfg[0]
+            rows = [[i+1, p['detail'], p['priority'], p.get('endpoint', label)]
+                    for i, p in enumerate(pts)]
+            struct_nodes.append({'type': 'h2', 'text': f"{label}（{len(pts)}个）"})
             struct_nodes.append({'type': 'table', 'headers': HEADERS, 'rows': rows})
         md = struct_to_markdown(struct_nodes)
 

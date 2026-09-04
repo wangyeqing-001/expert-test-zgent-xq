@@ -219,6 +219,8 @@ def generate_test_points():
                     'source': 'prd',
                     'raw_prd': req_md_text,
                     'title': req_title,
+                    'source_doc_url': it.get('source_doc_url', ''),
+                    'analysis_doc_url': it.get('feishu_url', ''),
                 })
             return jsonify({
                 'success': True,

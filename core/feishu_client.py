@@ -872,14 +872,14 @@ class FeishuClient:
                 logger.warning(f"表格降级写入失败: {resp.json().get('msg')}")
 
     def _parse_inline(self, text) -> list:
-        """解析行内Markdown格式(**bold**, `code`, *italic*)为飞书elements"""
+        """解析行内Markdown格式(**bold**, `code`, *italic*, [link](url))为飞书elements"""
         if text is None:
             return []
         if not isinstance(text, str):
             text = str(text)
         elements = []
-        # 正则匹配 **bold**, `code`, *italic*
-        pattern = r'(\*\*(.+?)\*\*|`([^`]+)`|\*(.+?)\*)'
+        # 组合正则：优先 markdown link [text](url)，然后 **bold**, `code`, *italic*
+        pattern = r'(\[([^\]]+)\]\((https?://[^\s)]+)\)|\*\*(.+?)\*\*|`([^`]+)`|\*(.+?)\*)'
         last_end = 0
         
         for m in re.finditer(pattern, text):
@@ -889,12 +889,15 @@ class FeishuClient:
                 if plain:
                     elements.append({"text_run": {"content": plain, "text_element_style": {}}})
             
-            if m.group(2):  # **bold**
-                elements.append({"text_run": {"content": m.group(2), "text_element_style": {"bold": True}}})
-            elif m.group(3):  # `code`
-                elements.append({"text_run": {"content": m.group(3), "text_element_style": {"inline_code": True}}})
-            elif m.group(4):  # *italic*
-                elements.append({"text_run": {"content": m.group(4), "text_element_style": {"italic": True}}})
+            if m.group(2) and m.group(3):  # [text](url)
+                elements.append({"text_run": {"content": m.group(2),
+                    "text_element_style": {"link": {"url": m.group(3)}}}})
+            elif m.group(4):  # **bold**
+                elements.append({"text_run": {"content": m.group(4), "text_element_style": {"bold": True}}})
+            elif m.group(5):  # `code`
+                elements.append({"text_run": {"content": m.group(5), "text_element_style": {"inline_code": True}}})
+            elif m.group(6):  # *italic*
+                elements.append({"text_run": {"content": m.group(6), "text_element_style": {"italic": True}}})
             
             last_end = m.end()
         

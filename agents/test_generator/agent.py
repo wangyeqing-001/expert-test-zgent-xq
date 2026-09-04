@@ -9,11 +9,13 @@ from core.tools import create_default_tools
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
-# platform → 该端 prompt 文件（与 test_point_generator._PLATFORM_CONFIG 对齐）
+# platform → 该端 prompt 文件（合并为 3 类：client/admin/backend）
+# App/Web/H5/Common/E2E 统一走 client_test.md，prompt 内按 framework/assertion_focus 参数自动适配
 _PROMPT_REGISTRY = {
-    'app': 'app_test.md', 'web': 'web_test.md', 'h5': 'h5_test.md',
-    'common': 'common_test.md', 'backend': 'backend_test.md',
-    'admin': 'admin_test.md', 'e2e': 'e2e_test.md',
+    'app': 'client_test.md', 'web': 'client_test.md', 'h5': 'client_test.md',
+    'common': 'client_test.md', 'e2e': 'client_test.md',
+    'backend': 'backend_test.md',
+    'admin': 'admin_test.md',
 }
 
 
