@@ -1,4 +1,5 @@
 """测试点生成Agent - 将需求转化为测试场景和测试点"""
+from __future__ import annotations
 import json
 import os
 import re
@@ -93,14 +94,15 @@ class TestPointGenerator(BaseAgent):
                 scenarios = self._points_to_scenarios(test_points)  # 下游兼容（旧路径）
             else:
                 print("  [测试点] prd直提失败, 降级规则生成 + 阶段2表格链路")
+                batches = []
                 scenarios = self._generate_by_rules(requirements)
-                local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title)
+                local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title, source=source)
         else:
             batches = []
             scenarios = self._generate_from_code_requirements(requirements, test_type)
             # 表格产出：本地.md + 飞书文档（列结构由testpoints_table.md指定）
             # 同时提取测试点JSON落盘，供下游用例生成（分批送入大模型）使用
-            local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title)
+            local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title, source=source)
 
         self.state = {
             'scenario_count': len(scenarios),
@@ -175,8 +177,11 @@ class TestPointGenerator(BaseAgent):
             except Exception as e:
                 print(f"⚠ [TestPointGenerator] LLM解析查询失败: {e}")
         
-        # 降级：提取英文函数名作为需求
-        func_names = re.findall(r'\b([a-zA-Z_]\w*)\b', query)
+        # 降级：提取英文函数名作为需求（排除常见非函数词）
+        _STOPWORDS = {'the', 'a', 'an', 'to', 'is', 'are', 'for', 'and', 'or', 'of', 'in',
+                      'web', 'api', 'test', 'app', 'h5', 'all', 'if', 'else', 'this', 'that'}
+        func_names = [w for w in re.findall(r'\b([a-zA-Z_]\w*)\b', query)
+                      if w.lower() not in _STOPWORDS and len(w) > 1]
         if func_names:
             return [{'function': name, 'complexity': 'medium', 'test_points': ['功能逻辑']} for name in func_names[:3]]
         
@@ -373,6 +378,7 @@ class TestPointGenerator(BaseAgent):
                         'endpoint': label,
                         'platform': platform,
                         'scope': scope,
+                        'module': str(item.get('module', '')).strip()[:60],
                         'detail': re.sub(r'[\r\n]+', ' ', str(item['detail'])).strip()[:120],
                         'priority': str(item.get('priority', 'P1')).strip().upper(),
                         'source': 'prd',
@@ -383,7 +389,6 @@ class TestPointGenerator(BaseAgent):
     @staticmethod
     def _parse_grouped_json(text: str):
         """[已废弃] 老格式端分组 JSON 解析 — 保留给历史调用方，内部转调 _parse_llm_json"""
-        agent = TestPointGenerator  # 占位，下面的实现独立使用
         cleaned = re.sub(r'```(?:json)?\s*', '', text or '')
         cleaned = re.sub(r'```', '', cleaned)
         m = re.search(r'\{.*\}', cleaned, re.DOTALL)
@@ -611,10 +616,11 @@ class TestPointGenerator(BaseAgent):
     
     # ---------- 表格产出（本地.md + 飞书文档） ----------
     
-    def _save_and_publish_table(self, scenarios: list, title: str) -> tuple:
+    def _save_and_publish_table(self, scenarios: list, title: str, source: str = 'code') -> tuple:
         """生成测试点表格文档：LLM按testpoints_table.md输出业务JSON → struct直写飞书；
         JSON失败时降级为确定性表格渲染（保证一定有产出）。
         同时提取四列测试点JSON落盘，供下游用例生成消费
+        :param source: 'code' or 'prd'，标记测试点来源供下游追溯
         :return: (local_path, feishu_url, json_path, test_points)
         """
         if not scenarios:
@@ -628,13 +634,13 @@ class TestPointGenerator(BaseAgent):
         
         if struct_nodes:
             # 先从table节点提取测试点JSON（供下游），再转对齐文本（顺序不可颠倒）
-            test_points = self._extract_test_points(struct_nodes)
+            test_points = self._extract_test_points(struct_nodes, source=source)
             md = struct_to_markdown(struct_nodes)
             mode = 'LLM表格(原生飞书表格)'
         else:
             print("  [测试点表格] LLM表格链路失败/未启用, 降级确定性渲染")
             struct_nodes = self._render_scenarios_struct(scenarios, title)
-            test_points = self._fallback_test_points(scenarios)
+            test_points = self._fallback_test_points(scenarios, source=source)
             md = struct_to_markdown(struct_nodes)
             mode = '确定性渲染(纯文本对齐)'
         
@@ -675,7 +681,7 @@ class TestPointGenerator(BaseAgent):
         return local_path, feishu_url, json_path, test_points
     
     @staticmethod
-    def _extract_test_points(struct_nodes: list) -> list:
+    def _extract_test_points(struct_nodes: list, source: str = 'code') -> list:
         """从struct表格节点提取四列测试点JSON（合并多个拆分表格）
         按表头名定位列，容错：表头不匹配时按四列顺序取
         """
@@ -696,13 +702,13 @@ class TestPointGenerator(BaseAgent):
                     'endpoint': cell('endpoint', 1),
                     'detail': cell('detail', 2),
                     'priority': cell('priority', 3),
-                    'source': 'code',   # 阶段2表格无此列，代码补齐供下游追溯
+                    'source': source,   # 阶段2表格无此列，代码补齐供下游追溯
                     'type': 'normal'    # 表格规范不含类型列，默认值
                 })
         return points
     
     @staticmethod
-    def _fallback_test_points(scenarios: list) -> list:
+    def _fallback_test_points(scenarios: list, source: str = 'code') -> list:
         """降级路径：从scenarios直接构造四列测试点JSON（与_render_scenarios_struct同源）"""
         def flat(s):
             return re.sub(r'[\r\n]+', ' ', str(s)).strip()[:80]
@@ -715,7 +721,7 @@ class TestPointGenerator(BaseAgent):
                 'endpoint': '客户端',
                 'detail': f'{module} - {desc}' if module else desc,
                 'priority': _PRIORITY_P_MAP.get(s.get('priority', ''), flat(s.get('priority', ''))),
-                'source': 'code',
+                'source': source,
                 'type': s.get('scenario', 'normal') or 'normal'
             })
         return points
@@ -751,28 +757,25 @@ class TestPointGenerator(BaseAgent):
     @staticmethod
     def _render_scenarios_struct(scenarios: list, title: str) -> list:
         """确定性降级：scenarios直接渲染为四列对齐表格struct节点（不依赖LLM）
-        列: 编号 | 涉及端 | 测试点详情 | 优先级
+        列: 编号 | 测试点详情 | 优先级 | 涉及端
         """
         def flat(s):
             return re.sub(r'[\r\n]+', ' ', str(s)).strip()[:80]
-        
+
+        n_high = sum(1 for s in scenarios if s.get('priority') == 'high')
         rows = []
-        for i, s in enumerate(scenarios, 1):
+        for i, s in enumerate(scenarios):
             module = flat(s.get('function') or s.get('name', ''))
             desc = flat(s.get('description', ''))
             rows.append([
-                f'{i:02d}',
-                '客户端',
+                i + 1,
                 f'{module} - {desc}' if module else desc,
-                _PRIORITY_P_MAP.get(s.get('priority', ''), flat(s.get('priority', '')))
+                _PRIORITY_P_MAP.get(s.get('priority', ''), flat(s.get('priority', ''))),
+                '客户端'
             ])
-        
-        n_high = sum(1 for s in scenarios if s.get('priority') == 'high')
         return [
             {'type': 'h1', 'text': '测试点清单'},
             {'type': 'paragraph', 'text': f'共{len(scenarios)}个测试点，其中P0（高优先级）{n_high}个。'},
             {'type': 'table', 'headers': ['序号', '测试点详情', '优先级', '涉及端'],
-             'rows': [[i+1, f'{flat(s.get("function") or s.get("name", ""))} - {flat(s.get("description", ""))}' if flat(s.get("function") or s.get("name", "")) else flat(s.get("description", "")),
-                       _PRIORITY_P_MAP.get(s.get('priority', ''), flat(s.get('priority', ''))),
-                       '客户端'] for i, s in enumerate(scenarios)]}
+             'rows': rows}
         ]
