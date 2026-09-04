@@ -637,6 +637,23 @@ def _run_generate_in_background(task_id: str, payload: dict):
 
         _progress_log(f"========== 全部完成：{total_cases}条用例，{len(feishu_docs)}个飞书文档 ==========")
 
+        # 把测试用例飞书文档 URL 写回 history
+        if feishu_docs and task_id_in:
+            try:
+                with _history_lock:
+                    with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                        hist_items = json.load(f)
+                    for hi in hist_items:
+                        if hi.get('task_id') == task_id_in:
+                            hi['testcase_feishu_docs'] = feishu_docs
+                            hi['testcase_total'] = total_cases
+                            break
+                    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(hist_items, f, ensure_ascii=False, indent=2)
+                _progress_log(f"✓ 测试用例飞书文档已写回 history")
+            except Exception as e:
+                logger.warning(f"写回 testcase_feishu_docs 到 history 失败: {e}")
+
     except Exception as e:
         logger.error(f"后台生成任务异常: {e}")
         _progress_log(f"✗ 任务异常终止: {type(e).__name__}: {str(e)[:200]}")

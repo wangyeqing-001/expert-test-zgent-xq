@@ -444,6 +444,17 @@
                     </div>
                     <div id="tp-content"></div>
                 </div>
+
+                <!-- 历史记录 -->
+                <div id="tp-history" class="result-section" style="margin-top:20px">
+                    <div class="result-header">
+                        <h3>📜 历史记录</h3>
+                        <button class="btn" style="padding:4px 12px;font-size:13px" onclick="loadHistory('tp-history-content')">刷新</button>
+                    </div>
+                    <div id="tp-history-content">
+                        <p style="color:#6c757d;padding:10px">加载中...</p>
+                    </div>
+                </div>
             </div>
 
             <!-- 测试生成分板 -->
@@ -480,6 +491,17 @@
                     </div>
                     <div id="gen-content"></div>
                 </div>
+
+                <!-- 历史记录 -->
+                <div id="gen-history" class="result-section" style="margin-top:20px">
+                    <div class="result-header">
+                        <h3>📜 历史记录</h3>
+                        <button class="btn" style="padding:4px 12px;font-size:13px" onclick="loadHistory('gen-history-content')">刷新</button>
+                    </div>
+                    <div id="gen-history-content">
+                        <p style="color:#6c757d;padding:10px">加载中...</p>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -500,11 +522,19 @@
 
     <script>
         // 切换标签页
+        let _historyLoaded = new Set();  // 已加载过历史的 tab 集合
         function switchTab(tab, el) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('[id$="-panel"]').forEach(p => p.style.display = 'none');
             el.classList.add('active');
             document.getElementById(tab + '-panel').style.display = 'block';
+            // 懒加载该 tab 的历史记录（只加载一次）
+            const boxMap = {requirement: 'req-history-content', testpoints: 'tp-history-content', generate: 'gen-history-content'};
+            const boxId = boxMap[tab];
+            if (boxId && !_historyLoaded.has(tab)) {
+                _historyLoaded.add(tab);
+                loadHistory(boxId);
+            }
         }
 
         // 填充示例
@@ -667,6 +697,16 @@
             const gen = it.feishu_url
                 ? `<a href="${it.feishu_url}" target="_blank" class="history-link">需求分析文档</a>`
                 : '<span style="color:#dc3545">未生成</span>';
+            const tp = it.testpoint_feishu_url
+                ? `<a href="${it.testpoint_feishu_url}" target="_blank" class="history-link">测试点</a>`
+                : (it.testpoints_json ? '<span style="color:#999">本地</span>' : '<span style="color:#ccc">-</span>');
+            // 测试用例：可能是 1~3 个飞书文档（客户端/后端/管理后台）
+            let tcHtml = '<span style="color:#ccc">-</span>';
+            if (it.testcase_feishu_docs && it.testcase_feishu_docs.length) {
+                tcHtml = it.testcase_feishu_docs.map(d =>
+                    `<a href="${d.feishu_url}" target="_blank" class="history-link">${d.group}(${d.case_count})</a>`
+                ).join(' · ');
+            }
             const taskTag = it.task_id
                 ? `<span class="history-task-id" title="点击复制" onclick="navigator.clipboard.writeText('${it.task_id}')">${it.task_id}</span>`
                 : '';
@@ -677,20 +717,21 @@
                 </div>
                 <div style="margin-top:6px;font-size:13px;display:flex;gap:16px;align-items:center;flex-wrap:wrap">
                     <span>📄 来源: ${src}</span>
-                    <span>✨ 生成: ${gen}</span>
+                    <span>✨ 分析: ${gen}</span>
+                    <span>🎯 测试点: ${tp}</span>
+                    <span>🧪 用例: ${tcHtml}</span>
                     <span style="flex:1"></span>
                     ${taskTag}
                 </div>
             </li>`;
         }
 
-        async function loadHistory() {
-            const box = document.getElementById('req-history-content');
+        async function loadHistory(boxId) {
+            boxId = boxId || 'req-history-content';
+            const box = document.getElementById(boxId);
             try {
-                const resp = await fetch(`/api/history?limit=${HISTORY_INITIAL}&offset=0`);
+                const resp = await fetch(`/api/history?limit=999&offset=0`);
                 const data = await resp.json();
-                historyTotal = data.total || 0;
-                historyLoaded = (data.items || []).length;
                 if (!data.items || !data.items.length) {
                     box.innerHTML = '<p style="color:#6c757d;padding:10px">暂无历史记录</p>';
                     return;
@@ -698,40 +739,9 @@
                 let html = '<ul class="history-list">';
                 data.items.forEach(it => { html += renderHistoryItem(it); });
                 html += '</ul>';
-                // 加载更多按钮
-                if (historyLoaded < historyTotal) {
-                    html += `<div style="text-align:center;margin-top:10px">
-                        <button class="btn" id="history-load-more" onclick="loadMoreHistory()" style="background:#667eea">加载更多</button>
-                    </div>`;
-                }
                 box.innerHTML = html;
             } catch (e) {
                 box.innerHTML = '<p style="color:#dc3545;padding:10px">历史记录加载失败</p>';
-            }
-        }
-
-        async function loadMoreHistory() {
-            const btn = document.getElementById('history-load-more');
-            if (btn) { btn.disabled = true; btn.textContent = '加载中...'; }
-            try {
-                const resp = await fetch(`/api/history?limit=${HISTORY_PAGE_SIZE}&offset=${historyLoaded}`);
-                const data = await resp.json();
-                historyTotal = data.total || 0;
-                const ul = document.querySelector('#req-history-content .history-list');
-                if (ul && data.items) {
-                    data.items.forEach(it => {
-                        ul.insertAdjacentHTML('beforeend', renderHistoryItem(it));
-                    });
-                    historyLoaded += data.items.length;
-                }
-                // 更新或移除按钮
-                if (historyLoaded >= historyTotal) {
-                    if (btn) btn.parentElement.remove();
-                } else {
-                    if (btn) { btn.disabled = false; btn.textContent = '加载更多'; }
-                }
-            } catch (e) {
-                if (btn) { btn.disabled = false; btn.textContent = '加载更多'; }
             }
         }
 
@@ -1211,7 +1221,9 @@
             p.classList.add('expanded');
             p.classList.remove('collapsed');
             startLogPolling();
-            loadHistory();  // 加载需求分析历史记录
+            // 加载默认 tab（需求分析）的历史
+            _historyLoaded.add('requirement');
+            loadHistory('req-history-content');
         });
     </script>
 </body>
