@@ -449,34 +449,12 @@
             <!-- 测试生成分板 -->
             <div id="generate-panel" class="content" style="display:none;">
                 <div class="input-section">
-                    <label for="gen-doc">需求文档（可选）：</label>
+                    <label for="gen-task-id">🆔 任务ID（输入后从测试点JSON加载batches，逐批按端生成测试代码）：</label>
+                    <input type="text" id="gen-task-id" placeholder="REQ-20260904-101235 或从测试点生成结果复制" style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:4px;margin-bottom:8px;font-family:monospace">
+                    <div style="font-size:12px;color:#888;margin-bottom:12px">💡 填了任务ID就走批量生成：按端路由prompt + 自动上传到对应飞书文件夹</div>
+
+                    <label for="gen-doc">或手动输入需求文档（可选，无任务ID时使用）：</label>
                     <textarea id="gen-doc" placeholder="粘贴需求文档内容，或填写需求描述...\n例如：\n用户登录功能需求：\n1. 支持用户名密码登录\n2. 用户名长度6-20位\n3. 密码需包含大小写字母和数字\n4. 登录失败3次后锁定账户5分钟" style="min-height: 150px;"></textarea>
-                    
-                    <!-- 飞书文档输入 -->
-                    <div style="margin-top: 15px; padding: 15px; background: #f0f7ff; border-radius: 8px; border-left: 4px solid #1890ff;">
-                        <label for="feishu-url" style="color: #1890ff; margin-bottom: 8px; display: block;">
-                            📄 或从飞书文档导入：
-                        </label>
-                        <div style="display: flex; gap: 10px;">
-                            <input 
-                                type="text" 
-                                id="feishu-url" 
-                                placeholder="粘贴飞书文档链接，如：https://xxx.feishu.cn/docx/xxxxx"
-                                style="flex: 1; padding: 10px; border: 2px solid #d9d9d9; border-radius: 6px; font-size: 14px;"
-                            />
-                            <button 
-                                class="btn" 
-                                onclick="importFeishuDoc()" 
-                                id="feishu-btn"
-                                style="padding: 10px 20px; white-space: nowrap;"
-                            >
-                                导入
-                            </button>
-                        </div>
-                        <small style="color: #666; margin-top: 5px; display: block;">
-                            💡 提示：需要先在.env中配置FEISHU_APP_ID和FEISHU_APP_SECRET
-                        </small>
-                    </div>
                 </div>
 
                 <div class="input-section">
@@ -789,7 +767,24 @@
                     badge.className = 'badge badge-success';
                     badge.textContent = `✓ ${data.scenarios.length} 个场景`;
 
-                    let html = '<ul class="scenarios-list">';
+                    // 自动填充测试生成的 task_id
+                    if (data.task_id) {
+                        document.getElementById('gen-task-id').value = data.task_id;
+                    }
+
+                    let html = '';
+                    // 批次信息
+                    if (data.batches && data.batches.length > 0) {
+                        html += `<div style="margin-bottom:12px;padding:10px;background:#e8f5e9;border-radius:6px;font-size:13px;color:#2e7d32">
+                            <strong>✓ 测试点已生成（${data.batches.length} 批），可切换到「测试生成」用任务ID批量生成测试代码</strong>
+                            ${data.feishu_url ? `<br><a href="${data.feishu_url}" target="_blank" style="color:#1890ff;text-decoration:none">📄 查看飞书测试点文档</a>` : ''}
+                        </div>`;
+                    }
+                    // 飞书链接
+                    if (data.feishu_url) {
+                        html += `<div style="margin-bottom:12px"><a href="${data.feishu_url}" target="_blank" style="color:#1890ff;text-decoration:none">📄 飞书测试点文档</a></div>`;
+                    }
+                    html += '<ul class="scenarios-list">';
                     data.scenarios.forEach(s => {
                         const pc = `priority-${s.priority || 'medium'}`;
                         html += `<li class="scenario-item">
@@ -812,24 +807,30 @@
         // 生成测试
         async function generateTest() {
             if (isProcessing) return;
+            const taskId = document.getElementById('gen-task-id').value.trim();
             const doc = document.getElementById('gen-doc').value.trim();
             const query = document.getElementById('gen-query').value.trim();
-            
-            if (!doc && !query) {
-                alert('请输入需求文档或补充说明');
+
+            if (!taskId && !doc && !query) {
+                alert('请输入任务ID，或需求文档/补充说明');
                 return;
             }
 
             showLoading('gen-btn', 'gen-result');
 
             try {
+                const body = {};
+                if (taskId) {
+                    body.task_id = taskId;
+                } else {
+                    body.requirement_doc = doc;
+                    body.query = query;
+                }
+
                 const response = await fetch('/api/generate', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        requirement_doc: doc,
-                        query: query
-                    })
+                    body: JSON.stringify(body)
                 });
 
                 const data = await response.json();
@@ -852,12 +853,42 @@
             badge.className = 'badge badge-success';
             badge.textContent = '✓ 生成成功';
 
-            const html = `
-                <p style="margin-bottom:15px;color:#495057">
-                    <strong>文件路径:</strong> ${data.file_path}
-                </p>
-                <pre class="code-block"><code>${escapeHtml(data.test_code)}</code></pre>
-            `;
+            let html = '';
+
+            // task_id 批量模式：展示多文件 + 飞书链接
+            if (data.test_files && data.test_files.length > 1) {
+                html += `<div style="margin-bottom:15px;color:#495057">
+                    <strong>共生成 ${data.test_files.length} 个文件（${data.total_batches || data.test_files.length} 批）</strong>
+                </div>`;
+                for (const f of data.test_files) {
+                    const label = f.platform_label || f.platform || '';
+                    const idx = f.batch_index || 1;
+                    const feishuLink = f.feishu_url
+                        ? ` <a href="${f.feishu_url}" target="_blank" style="color:#1890ff;font-size:13px;text-decoration:none">📄 飞书文档</a>`
+                        : '';
+                    html += `<div style="padding:10px 12px;margin-bottom:8px;background:#f9f9f9;border-radius:6px;border:1px solid #e8e8e8">
+                        <strong>${label} 第${idx}批</strong> — <code style="font-size:12px">${f.path}</code>${feishuLink}
+                    </div>`;
+                }
+            } else if (data.test_files && data.test_files.length === 1) {
+                // 单文件但有飞书链接
+                const f = data.test_files[0];
+                const feishuLink = f.feishu_url
+                    ? `<br><a href="${f.feishu_url}" target="_blank" style="color:#1890ff;font-size:14px;text-decoration:none">📄 查看飞书文档</a>`
+                    : '';
+                html += `<p style="margin-bottom:15px;color:#495057">
+                    <strong>文件路径:</strong> ${f.path}${feishuLink}
+                </p>`;
+            } else {
+                // 老路径单文件
+                const feishuLink = data.feishu_url
+                    ? `<br><a href="${data.feishu_url}" target="_blank" style="color:#1890ff;font-size:14px;text-decoration:none">📄 查看飞书文档</a>`
+                    : '';
+                html += `<p style="margin-bottom:15px;color:#495057">
+                    <strong>文件路径:</strong> ${data.file_path || ''}${feishuLink}
+                </p>`;
+                html += `<pre class="code-block"><code>${escapeHtml(data.test_code || '')}</code></pre>`;
+            }
 
             document.getElementById('gen-content').innerHTML = html;
         }
