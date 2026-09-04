@@ -337,8 +337,19 @@ class TestPointGenerator(BaseAgent):
             })
         return points
 
+    # platform(内部路由键) → scope(AI输出取值，反向补位老格式 fallback)
+    _PLATFORM_SCOPE_BACKMAP = {
+        'app':     'client_app',
+        'web':     'client_web',
+        'h5':      'client_h5',
+        'common':  'client_common',
+        'backend': 'backend',
+        'admin':   'admin',
+        'e2e':     'e2e',
+    }
+
     def _grouped_dict_to_points(self, grouped: dict) -> list:
-        """老路径：端分组嵌套 dict → 测试点列表（fallback）"""
+        """老路径：端分组嵌套 dict → 测试点列表（fallback）。platform→scope 反推补位"""
         points = []
         for path, platform in self._GROUP_PLATFORM_MAP:
             node = grouped
@@ -347,6 +358,7 @@ class TestPointGenerator(BaseAgent):
             if not isinstance(node, list):
                 continue
             label = self._PLATFORM_CONFIG[platform][0]
+            scope = self._PLATFORM_SCOPE_BACKMAP.get(platform, platform)
             for item in node:
                 if isinstance(item, dict) and str(item.get('detail', '')).strip():
                     t = str(item.get('type', 'normal')).strip().lower()
@@ -354,6 +366,7 @@ class TestPointGenerator(BaseAgent):
                         'id': '',
                         'endpoint': label,
                         'platform': platform,
+                        'scope': scope,
                         'detail': re.sub(r'[\r\n]+', ' ', str(item['detail'])).strip()[:120],
                         'priority': str(item.get('priority', 'P1')).strip().upper(),
                         'source': 'prd',
