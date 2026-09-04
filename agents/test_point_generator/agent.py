@@ -188,10 +188,10 @@ class TestPointGenerator(BaseAgent):
         # 降级方案：规则生成
         return self._generate_by_rules(requirements)
     
-    # ---------- prd直提链路（端分组JSON → 子端分组 + 同端内分批 TestBatch） ----------
-    
-    # platform → (label, max_per_batch, prompt文件, framework, assertion_focus)
-    # 端维度决定下游 TestGenerator 用哪套 prompt/框架；批次维度控制单次生成数量
+    # ---------- prd直提链路（扁平JSON → scope → platform 分组 + 同端内分批 TestBatch） ----------
+
+    # scope(AI输出) → platform(内部路由键) → (label, max_per_batch, prompt文件, framework, assertion_focus)
+    # scope 是 AI 必须输出的 7 选 1 取值；platform 是下游 TestGenerator 路由 prompt 用的英文键（保持稳定）
     _PLATFORM_CONFIG = {
         'app':     ('客户端-App',  8,  'app_test.md',     'Appium',              '页面元素/交互流程/视觉状态'),
         'web':     ('客户端-Web',  8,  'web_test.md',     'Playwright',          '页面导航/元素定位/显式等待'),
@@ -201,20 +201,33 @@ class TestPointGenerator(BaseAgent):
         'admin':   ('管理后台',    10, 'admin_test.md',   'Playwright',          '页面功能/权限控制/表单校验'),
         'e2e':     ('端到端集成',   6,  'e2e_test.md',     'Playwright+requests', '跨端流程/数据流转/状态同步'),
     }
-    # 端分组JSON路径 → platform（扩展现状：新增 backend/admin/e2e 提取）
+
+    # ===== 新：扁平 JSON 模式 =====
+    # AI 输出扁平数组，每条带 scope 字段（7 选 1）。此表做 scope→platform→endpoint 映射。
+    _SCOPE_PLATFORM_MAP = {
+        'client_app':     'app',
+        'client_web':     'web',
+        'client_h5':      'h5',
+        'client_common':  'common',
+        'backend':        'backend',
+        'admin':          'admin',
+        'e2e':            'e2e',
+    }
+    _VALID_SCOPES = set(_SCOPE_PLATFORM_MAP.keys())
+
+    # ===== 老：端分组 JSON 模式（保留作 fallback 兼容） =====
     _GROUP_PLATFORM_MAP = [
         (('client', 'app'), 'app'),
         (('client', 'web'), 'web'),
         (('client', 'h5'),  'h5'),
         (('client', 'common'), 'common'),
         (('backend',),          'backend'),
-        (('operation_backend',), 'admin'),   # prompt键保留 operation_backend，代码层映射 admin
+        (('operation_backend',), 'admin'),
         (('e2e',),              'e2e'),
     ]
-    # 兼容别名（旧名指向新语义：元素为 (path, platform)）
-    _GROUP_ENDPOINT_MAP = _GROUP_PLATFORM_MAP
-    
-    # 合法测试点类型（供下游分批）
+    _GROUP_ENDPOINT_MAP = _GROUP_PLATFORM_MAP  # 兼容别名
+
+    # 合法测试点类型
     _VALID_TYPES = {'normal', 'edge_case', 'error_handling'}
     
     def _extract_constraints(self, prd_text: str) -> str:
@@ -232,7 +245,9 @@ class TestPointGenerator(BaseAgent):
             return ''
     
     def _extract_testpoints_from_prd(self, prd_text: str, structured_constraints: str = None) -> list:
-        """按prd_to_testpoints.md直提四列测试点：主材料=原始PRD，辅助材料=约束清单（门控使用）
+        """按prd_to_testpoints.md直提测试点：
+        - 新路径：AI 输出扁平 JSON 数组，每条带 scope 字段 → scope 白名单 + platform 映射
+        - 老路径（fallback）：端分组嵌套 JSON dict → 按 GROUP_PLATFORM_MAP 遍历
         :param structured_constraints: None=自动跑分支A；''=无辅助材料；其他=直接使用
         """
         if not (self.llm and prd_text):
@@ -244,30 +259,19 @@ class TestPointGenerator(BaseAgent):
                 prd_requirements=prd_text[:12000],
                 structured_constraints=(structured_constraints or '（无辅助材料）')[:4000])
             response = self.llm.generate(prompt, max_tokens=16000)
-            grouped = self._parse_grouped_json(response)
-            if not isinstance(grouped, dict):
-                return []
+
+            parsed = self._parse_llm_json(response)
             points = []
-            for path, platform in self._GROUP_PLATFORM_MAP:
-                node = grouped
-                for k in path:
-                    node = node.get(k) if isinstance(node, dict) else None
-                if not isinstance(node, list):
-                    continue
-                label = self._PLATFORM_CONFIG[platform][0]  # 涉及端中文标签
-                for item in node:
-                    if isinstance(item, dict) and str(item.get('detail', '')).strip():
-                        t = str(item.get('type', 'normal')).strip().lower()
-                        points.append({
-                            'id': '',
-                            'endpoint': label,    # 涉及端（中文，飞书表格展示用）
-                            'platform': platform,  # 英文键，供下游 TestGenerator 路由 prompt
-                            'detail': re.sub(r'[\r\n]+', ' ', str(item['detail'])).strip()[:120],
-                            'priority': str(item.get('priority', 'P1')).strip().upper(),
-                            'source': 'prd',  # 来源标识，供下游追溯
-                            'type': t if t in self._VALID_TYPES else 'normal'
-                        })
-            # 统一重新编号（保证01连续递增，防LLM漏号/重复）
+            if isinstance(parsed, list):
+                # ===== 新：扁平数组路径 =====
+                points = self._flatten_items_to_points(parsed)
+            elif isinstance(parsed, dict):
+                # ===== 老：端分组 JSON 路径（AI 还没切换过来时的 fallback） =====
+                points = self._grouped_dict_to_points(parsed)
+
+            if not points:
+                return []
+            # 统一重新编号（保证 01 连续递增，防 LLM 漏号/重复）
             for i, p in enumerate(points, 1):
                 p['id'] = f'{i:02d}'
             if points:
@@ -276,10 +280,91 @@ class TestPointGenerator(BaseAgent):
         except Exception as e:
             print(f"⚠ [TestPointGenerator] prd直提异常: {type(e).__name__}: {str(e)[:100]}")
             return []
-    
+
+    def _parse_llm_json(self, text: str):
+        """统一解析 LLM 输出 JSON，自动判断扁平数组 or 嵌套 dict"""
+        cleaned = re.sub(r'```(?:json)?\s*', '', text or '')
+        cleaned = re.sub(r'```', '', cleaned).strip()
+        # 优先数组：找最外层 [...]
+        arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        obj_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        candidates = []
+        if arr_match: candidates.append(arr_match.group(0))
+        if obj_match: candidates.append(obj_match.group(0))
+        if not candidates:
+            return None
+        for s in candidates:
+            try:
+                return json.loads(s)
+            except json.JSONDecodeError:
+                fixed = re.sub(r',\s*([}\]])', r'\1', s)
+                try:
+                    return json.loads(fixed)
+                except json.JSONDecodeError:
+                    continue
+        print(f"⚠ [TestPointGenerator] JSON 解析失败（扁平 & 老格式均不通）")
+        return None
+
+    def _flatten_items_to_points(self, items: list) -> list:
+        """扁平数组 → 测试点列表（scope 白名单 + 字段校验）"""
+        points = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            detail = str(item.get('detail', '')).strip()
+            if not detail:
+                continue
+            scope = str(item.get('scope', '')).strip()
+            platform = self._SCOPE_PLATFORM_MAP.get(scope)
+            if platform is None:
+                # scope 非法：跳过，但记录日志方便排查 prompt 没生效
+                print(f"  [扁平解析] 跳过非法 scope={scope!r}, detail={detail[:40]!r}")
+                continue
+            t = str(item.get('type', 'normal')).strip().lower()
+            label = self._PLATFORM_CONFIG[platform][0]
+            # module 字段 AI 新输出里有，但下游当前没用到；保留即可（会随 test_points_json_path 落盘）
+            module = str(item.get('module', '')).strip()
+            points.append({
+                'id': '',
+                'endpoint': label,
+                'platform': platform,
+                'detail': re.sub(r'[\r\n]+', ' ', detail)[:120],
+                'priority': str(item.get('priority', 'P1')).strip().upper(),
+                'source': 'prd',
+                'type': t if t in self._VALID_TYPES else 'normal',
+                'module': module,
+                'scope': scope,
+            })
+        return points
+
+    def _grouped_dict_to_points(self, grouped: dict) -> list:
+        """老路径：端分组嵌套 dict → 测试点列表（fallback）"""
+        points = []
+        for path, platform in self._GROUP_PLATFORM_MAP:
+            node = grouped
+            for k in path:
+                node = node.get(k) if isinstance(node, dict) else None
+            if not isinstance(node, list):
+                continue
+            label = self._PLATFORM_CONFIG[platform][0]
+            for item in node:
+                if isinstance(item, dict) and str(item.get('detail', '')).strip():
+                    t = str(item.get('type', 'normal')).strip().lower()
+                    points.append({
+                        'id': '',
+                        'endpoint': label,
+                        'platform': platform,
+                        'detail': re.sub(r'[\r\n]+', ' ', str(item['detail'])).strip()[:120],
+                        'priority': str(item.get('priority', 'P1')).strip().upper(),
+                        'source': 'prd',
+                        'type': t if t in self._VALID_TYPES else 'normal',
+                    })
+        return points
+
     @staticmethod
     def _parse_grouped_json(text: str):
-        """解析端分组JSON对象（去代码块标记 + 截取花括号区间 + 尾逗号修复）"""
+        """[已废弃] 老格式端分组 JSON 解析 — 保留给历史调用方，内部转调 _parse_llm_json"""
+        agent = TestPointGenerator  # 占位，下面的实现独立使用
         cleaned = re.sub(r'```(?:json)?\s*', '', text or '')
         cleaned = re.sub(r'```', '', cleaned)
         m = re.search(r'\{.*\}', cleaned, re.DOTALL)
