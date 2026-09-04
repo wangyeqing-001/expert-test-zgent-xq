@@ -207,13 +207,13 @@ class TestPointGenerator(BaseAgent):
     # prompt 文件合并为 3 类：client_test.md（客户端含 App/Web/H5/通用/E2E）/ admin_test.md（管理后台）/ backend_test.md（后端服务）
     # framework 和 assertion_focus 保留细粒度差异，prompt 内按参数自动适配
     _PLATFORM_CONFIG = {
-        'app':     ('客户端-App',  8,  'client_test.md', 'Appium',              '页面元素/交互流程/视觉状态'),
-        'web':     ('客户端-Web',  8,  'client_test.md', 'Playwright',          '页面导航/元素定位/显式等待'),
-        'h5':      ('客户端-H5',   8,  'client_test.md', 'Playwright',          'WebView兼容/页面适配/交互'),
-        'common':  ('客户端-通用', 8,  'client_test.md', 'Playwright/Appium',   'UI交互/状态反馈/兼容性'),
-        'backend': ('后端服务',    12, 'backend_test.md', 'requests+pytest',     '接口返回码/数据字段/数据库状态'),
-        'admin':   ('管理后台',    10, 'admin_test.md',   'Playwright',          '页面功能/权限控制/表单校验'),
-        'e2e':     ('端到端集成',   6,  'client_test.md',  'Playwright+requests', '跨端流程/数据流转/状态同步'),
+        'app':     ('客户端-App',  3,  'client_test.md', 'Appium',              '页面元素/交互流程/视觉状态'),
+        'web':     ('客户端-Web',  3,  'client_test.md', 'Playwright',          '页面导航/元素定位/显式等待'),
+        'h5':      ('客户端-H5',   3,  'client_test.md', 'Playwright',          'WebView兼容/页面适配/交互'),
+        'common':  ('客户端-通用', 3,  'client_test.md', 'Playwright/Appium',   'UI交互/状态反馈/兼容性'),
+        'backend': ('后端服务',     3, 'backend_test.md', 'requests+pytest',     '接口返回码/数据字段/数据库状态'),
+        'admin':   ('管理后台',     3, 'admin_test.md',   'Playwright',          '页面功能/权限控制/表单校验'),
+        'e2e':     ('端到端集成',   3,  'client_test.md',  'Playwright+requests', '跨端流程/数据流转/状态同步'),
     }
 
     # ===== 新：扁平 JSON 模式 =====
@@ -243,7 +243,51 @@ class TestPointGenerator(BaseAgent):
 
     # 合法测试点类型
     _VALID_TYPES = {'normal', 'edge_case', 'error_handling'}
-    
+
+    @staticmethod
+    def _summarize_res_schema(res_schema) -> str:
+        """将 YAPI 出参 JSON Schema 或文本转为结构化摘要（字段名+类型+必填），
+        避免原样截断大段 JSON Schema 导致关键信息丢失。
+        支持格式：
+        - dict（YAPI 标准化后的 response_schema）
+        - str（JSON Schema 字符串或纯文本描述）
+        - 空 → 返回 '（无出参定义）'
+        """
+        if not res_schema:
+            return '  （无出参定义）'
+
+        # 如果是 dict（标准化后的结构）
+        if isinstance(res_schema, dict):
+            props = res_schema.get('properties', {})
+            if not props:
+                return '  （无出参字段）'
+            lines = []
+            for name, info in props.items():
+                if isinstance(info, dict):
+                    typ = info.get('type', '')
+                    req = '必填' if info.get('required') else '可选'
+                    desc = info.get('description', '')[:50]
+                    lines.append(f"    - {name} ({typ}, {req}): {desc}" if desc else f"    - {name} ({typ}, {req})")
+                else:
+                    lines.append(f"    - {name}")
+            return '\n'.join(lines)
+
+        # 如果是 str → 尝试 JSON 解析
+        if isinstance(res_schema, str):
+            try:
+                parsed = json.loads(res_schema)
+                if isinstance(parsed, dict):
+                    return TestPointGenerator._summarize_res_schema(parsed)
+            except Exception:
+                pass
+            # 不是 JSON，当作纯文本，截断到 300 字符（比原来 800 短但更聚焦）
+            text = res_schema.strip()
+            if len(text) > 300:
+                text = text[:300] + '...'
+            return f'  {text}'
+
+        return '  （格式未知）'
+
     def _extract_constraints(self, prd_text: str) -> str:
         """分支A：从原始PRD提取约束清单（防遗漏索引），失败返回''"""
         try:
@@ -291,15 +335,15 @@ class TestPointGenerator(BaseAgent):
                         )
                     param_text = '\n'.join(param_parts) if param_parts else '  （无入参定义）'
 
-                    # 出参摘要（截断）
-                    res_text = res_schema[:800] if res_schema else '（无出参定义）'
+                    # 出参：结构化摘要——只保留字段名+类型+必填，不原样截断 JSON Schema
+                    res_text = self._summarize_res_schema(res_schema)
 
                     yapi_lines.append(
                         f"### 接口{i}: {title}\n"
                         f"- 路径: {method} {path}\n"
                         f"- 描述: {desc}\n"
                         f"- 入参:\n{param_text}\n"
-                        f"- 出参:\n  {res_text}\n"
+                        f"- 出参:\n{res_text}\n"
                         f"- 变更类型: 待分析\n"
                         f"- 关联需求: 待分析"
                     )
@@ -308,8 +352,8 @@ class TestPointGenerator(BaseAgent):
             prompt = build_prompt(_DIR, 'prd_to_testpoints.md',
                 prd_requirements=prd_text[:12000],
                 structured_constraints=(structured_constraints or '（无辅助材料）')[:4000],
-                yapi_interfaces=yapi_text[:6000])
-            response = self.llm.generate(prompt, max_tokens=16000)
+                yapi_interfaces=yapi_text[:8000])
+            response = self.llm.generate(prompt, max_tokens=8000)
 
             parsed, interface_index = self._parse_llm_json(response)
             points = []
@@ -808,7 +852,7 @@ class TestPointGenerator(BaseAgent):
         try:
             prompt = build_prompt(_DIR, 'testpoints_table.md',
                 scenarios_json=json.dumps(scenarios, ensure_ascii=False)[:6000])
-            response = self.llm.generate(prompt, max_tokens=16000)
+            response = self.llm.generate(prompt, max_tokens=4000)
             nodes = parse_struct_json(response)
             if nodes:
                 n_table = sum(1 for n in nodes if n['type'] == 'table')

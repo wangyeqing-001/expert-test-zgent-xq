@@ -1,11 +1,16 @@
-"""测试生成Agent - 根据需求生成测试代码（ReAct架构）"""
+"""测试生成Agent - 根据需求生成测试用例（JSON 输出，整合写入飞书文档）"""
 import os
+import re
+import json
+import logging
 from typing import Any
 from datetime import datetime
 from agents.base_agent import BaseAgent
 from agents._prompt_utils import build_prompt
 from core.llm_client import LLMClient
 from core.tools import create_default_tools
+
+logger = logging.getLogger(__name__)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -16,6 +21,23 @@ _PROMPT_REGISTRY = {
     'common': 'client_test.md', 'e2e': 'client_test.md',
     'backend': 'backend_test.md',
     'admin': 'admin_test.md',
+}
+
+# platform → 飞书测试用例文件夹 token（按端分目录存放）
+# 客户端: EmxffEI8elYwmgdqxbRcn1djnRg | 后台: SJNOfTJFclehy5dT8tzcVoKxnMe | 后端: EkzxfodGglVSrRdM9m9cQW4vnVd
+_PLATFORM_FOLDER_MAP = {
+    'app': 'EmxffEI8elYwmgdqxbRcn1djnRg', 'web': 'EmxffEI8elYwmgdqxbRcn1djnRg',
+    'h5': 'EmxffEI8elYwmgdqxbRcn1djnRg', 'common': 'EmxffEI8elYwmgdqxbRcn1djnRg',
+    'e2e': 'EmxffEI8elYwmgdqxbRcn1djnRg',
+    'backend': 'EkzxfodGglVSrRdM9m9cQW4vnVd',
+    'admin': 'SJNOfTJFclehy5dT8tzcVoKxnMe',
+}
+
+# platform → 大类标签（用于飞书文档分组）
+_PLATFORM_GROUP_LABEL = {
+    'app': '客户端', 'web': '客户端', 'h5': '客户端', 'common': '客户端', 'e2e': '客户端',
+    'backend': '后端',
+    'admin': '管理后台',
 }
 
 
@@ -36,29 +58,32 @@ class TestGeneratorAgent(BaseAgent):
     def execute(self, input_data: dict) -> dict:
         """
         执行测试生成任务（简化流程，完整流程用run()）
+        旧链路兼容：生成 Python 代码并保存 .py 文件。
+        新链路（execute_batch）输出 JSON 测试用例，不走此方法。
         :param input_data: {'scenario': dict, 'source_file': str}
         :return: {'test_case': dict, 'file_path': str}
         """
         if not self.validate_input(input_data):
             raise ValueError("Invalid input: scenario and source_file required")
-        
+
         scenario = input_data['scenario']
         source_file = input_data['source_file']
-        
+
         # 记录到工作记忆
         self.memory.add_working({'scenario': scenario, 'file': source_file})
-        
+
         # 构建prompt
         prompt = self._build_prompt(scenario)
-        
+
         # 调用LLM生成
         if self.llm:
             response = self.llm.generate(prompt)
         else:
             response = self._get_template(scenario['function'])
-        
-        test_code = self._parse_response(response)
-        
+
+        # 旧链路：解析 Python 代码块（execute_batch 走 JSON 解析，不走这里）
+        test_code = self._parse_code_response(response)
+
         # 构建测试结果
         test_case = {
             'function_name': scenario['function'],
@@ -274,57 +299,297 @@ class TestGeneratorAgent(BaseAgent):
             priority=scenario.get('priority', 'medium'),
             description=scenario['description'])
 
-    def execute_batch(self, batch: dict) -> dict:
-        """按端 TestBatch 生成测试代码（platform 路由到该端专用 prompt）
+    # 每批最多测试点数（超过则在拆批阶段处理，这里 assert 兜底）
+    _MAX_POINTS_PER_BATCH = 5
+
+    def execute_batch(self, batch: dict, _depth: int = 0) -> dict:
+        """按端 TestBatch 生成 JSON 测试用例（platform 路由到该端专用 prompt）
+        若 LLM 输出被截断，自动将本 batch 拆成更小的子 batch 递归处理并合并结果。
         :param batch: {platform, platform_label, batch_index, shared_context, test_points, priority}
-        :return: {'file_path': str, 'platform': str, 'batch_index': int}
+        :param _depth: 递归深度（防无限递归，最多 4 层）
+        :return: {'test_cases': list, 'platform': str, 'batch_index': int, 'platform_label': str}
         """
         platform = batch.get('platform', 'common')
         sc = batch.get('shared_context') or {}
-        # 测试点列表文本：id + detail + type + priority
+        pts = batch.get('test_points', [])
+
+        # === 安全断言：每批 ≤ _MAX_POINTS_PER_BATCH，超过说明上游拆批有 bug ===
+        if _depth == 0 and len(pts) > self._MAX_POINTS_PER_BATCH:
+            logger.warning(
+                f"batch 过大：{platform}-batch{batch.get('batch_index', 1)} 有 {len(pts)} 点，"
+                f"超过上限 {self._MAX_POINTS_PER_BATCH}，自动拆分为子批"
+            )
+            mid = len(pts) // 2
+            test_cases = []
+            for sub_pts in (pts[:mid], pts[mid:]):
+                sub_batch = dict(batch)
+                sub_batch['test_points'] = sub_pts
+                sub = self.execute_batch(sub_batch, _depth=_depth + 1)
+                test_cases.extend(sub.get('test_cases', []))
+            return {
+                'test_cases': test_cases,
+                'platform': platform,
+                'batch_index': batch.get('batch_index', 1),
+                'platform_label': batch.get('platform_label', platform),
+            }
+
+        # 测试点列表文本
         lines = []
-        for p in batch.get('test_points', []):
-            lines.append(f"- [{p.get('id', '')}] {p.get('detail', '')}（类型:{p.get('type', 'normal')}，优先级:{p.get('priority', 'P1')}）")
+        for p in pts:
+            module = p.get('module', '')
+            detail = p.get('detail', '')
+            priority = p.get('priority', 'P1')
+            line = f"- {detail}（优先级:{priority}）"
+            if module:
+                line = f"- 【{module}】{detail}（优先级:{priority}）"
+            lines.append(line)
         test_points_list = '\n'.join(lines) or '（无）'
-        prompt_file = self._PROMPT_REGISTRY.get(platform, 'common_test.md')
+        prompt_file = _PROMPT_REGISTRY.get(platform, 'client_test.md')
         prompt = build_prompt(_DIR, prompt_file,
             platform_label=batch.get('platform_label', platform),
             framework=sc.get('framework', 'Playwright'),
             assertion_focus=sc.get('assertion_focus', ''),
             batch_index=batch.get('batch_index', 1),
-            test_points_list=test_points_list)
+            test_points_list=test_points_list,
+            requirement_context=sc.get('requirement_context', '（无）'))
+        test_cases = []
         if self.llm:
-            response = self.llm.generate(prompt)
+            try:
+                response = self.llm.generate(prompt, max_tokens=3500)
+            except Exception as e:
+                logger.warning(f"LLM 请求异常: {e}")
+                response = ''
+            test_cases = self._parse_json_response(response)
+            # 截断 → 递归拆子批（最小粒度 2，再小就不拆了）
+            if self._is_truncated(response) and len(pts) > 2 and _depth < 4:
+                mid = len(pts) // 2
+                left_pts, right_pts = pts[:mid], pts[mid:]
+                logger.warning(
+                    f"[递归{_depth+1}] {platform}-batch{batch.get('batch_index', 1)} "
+                    f"被截断（{len(pts)}点→{len(test_cases)}条），拆为 {len(left_pts)}+{len(right_pts)} 子批"
+                )
+                test_cases = []
+                for sub_pts in (left_pts, right_pts):
+                    sub_batch = dict(batch)
+                    sub_batch['test_points'] = sub_pts
+                    sub_batch['batch_index'] = f"{batch.get('batch_index', 1)}.{_depth+1}"
+                    sub = self.execute_batch(sub_batch, _depth=_depth + 1)
+                    test_cases.extend(sub.get('test_cases', []))
+            elif self._is_truncated(response) and not test_cases:
+                logger.warning(
+                    f"[截断但已到最小粒度] {platform}-batch{batch.get('batch_index', 1)}: 0条可提取"
+                )
         else:
-            response = self._get_template(platform)  # mock 降级
-        code = self._parse_response(response)
-        test_case = {
-            'function_name': f"batch{batch.get('batch_index', 1)}",
-            'scenario': batch.get('priority', 'medium'),
-            'test_code': code,
-            'priority': batch.get('priority', 'medium'),
+            response = '{"test_cases": []}'
+            test_cases = self._parse_json_response(response)
+        print(f"  ✓ [{platform} · 第{batch.get('batch_index', 1)}批] 生成 {len(test_cases)} 条用例")
+        return {
+            'test_cases': test_cases,
+            'platform': platform,
+            'batch_index': batch.get('batch_index', 1),
+            'platform_label': batch.get('platform_label', platform),
         }
-        # save_test_case 取 basename 作文件名前缀；这里用 platform 作占位源文件名
-        source_file = f"{platform}.py"
-        file_path = self.save_test_case(test_case, source_file)
-        print(f"  ✓ [{platform} · 第{batch.get('batch_index', 1)}批] 生成 {len(batch.get('test_points', []))} 个用例 → {file_path}")
-        return {'file_path': file_path, 'platform': platform, 'batch_index': batch.get('batch_index', 1)}
 
-    def _parse_response(self, response):
-        """解析LLM响应，提取Python代码块
+    @staticmethod
+    def _is_truncated(response: str) -> bool:
+        """检测 LLM 输出是否被截断"""
+        # 1. 检查 ```json 代码块是否闭合
+        if '```json' in response:
+            # 若只开没关 → 截断
+            open_cnt = response.count('```json')
+            close_cnt = response.count('```') - open_cnt
+            if close_cnt < open_cnt:
+                return True
+            # 若能解析到闭合块，尝试解析 JSON
+            m = re.search(r'```json\s*\n(.*?)```', response, re.DOTALL)
+            if m:
+                try:
+                    json.loads(m.group(1).strip())
+                    return False
+                except Exception:
+                    return True
+        # 2. 检查纯 JSON 是否能解析
+        stripped = response.strip()
+        if stripped.startswith('{') or stripped.startswith('['):
+            try:
+                json.loads(stripped)
+                return False
+            except Exception:
+                return True
+        # 3. 兜底：结尾未在正常断句位置
+        tail = stripped[-30:] if stripped else ''
+        if tail and tail[-1] not in '.。!！?？」』]\n':
+            return True
+        return False
+
+    def _generate_cases_with_retry(self, prompt: str, initial_max_tokens: int = 3000,
+                                   max_retries: int = 2) -> list:
+        """带重试的弹性策略：若 LLM 输出被截断，翻倍 max_tokens 重试，最多 max_retries 次。
+        每次重试都会先尝试用截断修复逻辑提取已有的完整用例，避免丢弃成功部分。
+        """
+        max_tokens = initial_max_tokens
+        last_result = []
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.llm.generate(prompt, max_tokens=max_tokens)
+            except Exception as e:
+                logger.warning(f"[重试{attempt+1}/{max_retries}] LLM 请求异常: {e}")
+                if attempt < max_retries:
+                    max_tokens = min(max_tokens * 2, 8000)
+                    continue
+                raise
+            cases = self._parse_json_response(response)
+            if not self._is_truncated(response):
+                # 未截断，直接返回
+                return cases
+            # 被截断：记录本次提取到的用例数（如果有），重试翻倍
+            if cases:
+                last_result = cases
+            if attempt < max_retries:
+                old_mt = max_tokens
+                max_tokens = min(max_tokens * 2, 8000)
+                logger.warning(
+                    f"[重试{attempt+1}/{max_retries}] LLM 输出被截断（提取{len(cases)}条），"
+                    f"max_tokens {old_mt}→{max_tokens} 重新生成"
+                )
+                continue
+            # 全部重试仍截断，返回最后一次提取到的用例
+            if last_result:
+                logger.warning(f"所有重试仍截断，返回最后提取的 {len(last_result)} 条用例")
+                return last_result
+            return []
+        return last_result
+
+    def _parse_json_response(self, response: str) -> list:
+        """解析 LLM 响应为 JSON 测试用例列表
+        - 优先提取 ```json ``` 代码块
+        - 降级：直接 json.loads 整段响应
+        - 再降级：正则提取 {..."test_cases": [...]} 段
+        - 终极兜底：尝试修复被截断的 JSON（去掉最后不完整的 test_case）
+        """
+        response = response.strip()
+        # 1. 尝试提取 ```json 代码块
+        json_text = None
+        json_block = re.search(r'```json\s*\n(.*?)```', response, re.DOTALL)
+        if json_block:
+            json_text = json_block.group(1).strip()
+        else:
+            json_text = response
+
+        # 尝试直接解析
+        for attempt in (json_text,):
+            try:
+                data = json.loads(attempt)
+                return data.get('test_cases', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            except json.JSONDecodeError:
+                pass
+
+        # 尝试正则提取完整 JSON
+        brace_match = re.search(r'\{.*\}', json_text, re.DOTALL)
+        if brace_match:
+            try:
+                data = json.loads(brace_match.group(0))
+                return data.get('test_cases', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            except json.JSONDecodeError:
+                pass
+
+        # 终极兜底：修复被截断的 JSON
+        # LLM 可能输出 {"test_cases": [case1, case2, {"test_module": "..."} (截断不完整)
+        # 尝试补齐 test_cases 数组，去掉最后不完整的 case
+        try:
+            # 找到 test_cases 数组开始
+            tc_start = json_text.find('"test_cases"')
+            if tc_start == -1:
+                logger.warning(f"JSON 解析失败（无 test_cases 键），返回空用例。响应前200字符: {response[:200]}")
+                return []
+            # 找到 test_cases 后的 [
+            arr_start = json_text.find('[', tc_start)
+            if arr_start == -1:
+                logger.warning(f"JSON 解析失败（test_cases 后无数组），返回空用例。响应前200字符: {response[:200]}")
+                return []
+            # 从 arr_start 之后找最后一个完整的 test_case（以 } 结尾，且 } 后是 , 或 ] 或结尾）
+            after_arr = json_text[arr_start + 1:]
+            last_complete = -1
+            depth = 0
+            i = 0
+            while i < len(after_arr):
+                c = after_arr[i]
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        # 找到一个完整 case 的结尾 }
+                        last_complete = i
+                i += 1
+            if last_complete >= 0:
+                # 截取到这个完整的 }，然后补齐 ]}
+                fixed_inner = after_arr[:last_complete + 1]
+                fixed_json = json_text[:arr_start + 1] + fixed_inner + ']}'
+                data = json.loads(fixed_json)
+                cases = data.get('test_cases', [])
+                if cases:
+                    logger.warning(f"JSON 被截断但修复成功，提取 {len(cases)} 条完整用例")
+                    return cases
+        except (json.JSONDecodeError, Exception):
+            pass
+
+        logger.warning(f"LLM 响应解析为 JSON 失败，返回空用例列表。响应前200字符: {response[:200]}")
+        return []
+
+    @staticmethod
+    def cases_to_feishu_struct(test_cases: list, platform_label: str = '') -> list:
+        """将 JSON 测试用例列表转为飞书 struct_nodes（用于 create_doc_from_struct）
+        对齐参考文档格式：H1=模块 → H2=测试点 → 每测试点下一个表格
+        表格列：优先级 | 测试场景 | 测试步骤 | 预期结果 | 执行结果 | 备注
+        """
+        if not test_cases:
+            return [{'type': 'paragraph', 'text': '（本批次无测试用例）'}]
+
+        # 按 test_module → test_point 两级分组
+        by_module: dict[str, dict[str, list]] = {}
+        for tc in test_cases:
+            mod = tc.get('test_module', '未分类')
+            point = tc.get('test_point', tc.get('test_scenario', ''))
+            by_module.setdefault(mod, {}).setdefault(point, []).append(tc)
+
+        struct_nodes = []
+        HEADERS = ['优先级', '测试场景', '测试步骤', '预期结果', '执行结果', '备注']
+
+        for mod, points in by_module.items():
+            struct_nodes.append({'type': 'h1', 'text': mod})
+            for point, cases in points.items():
+                struct_nodes.append({'type': 'h2', 'text': point})
+                rows = []
+                for tc in cases:
+                    steps = '\n'.join(tc.get('test_steps', []))
+                    expected = '\n'.join(tc.get('expected_results', []))
+                    rows.append([
+                        tc.get('priority', ''),
+                        tc.get('test_scenario', ''),
+                        steps,
+                        expected,
+                        '未执行',
+                        tc.get('remarks', '无'),
+                    ])
+                struct_nodes.append({'type': 'table', 'headers': HEADERS, 'rows': rows})
+
+        return struct_nodes
+
+    def _parse_code_response(self, response: str) -> str:
+        """旧链路兼容：解析 LLM 响应中的 Python 代码块（execute 方法使用）
         - 优先 ```python ``` 标记
-        - 找不到时检测是否有非Python语言标记（typescript/javascript/ts/js），有则报错（防TS代码存进.py）
-        - 无任何代码块标记时检查内容是否像Python特征，像则直接返回，否则报错
+        - 无标记时检测是否像 Python，像则直接返回
         """
         if '```python' in response:
             start = response.find('```python') + 9
             end = response.find('```', start)
             return response[start:end].strip()
-        import re as _re
-        lang_block = _re.search(r'```(typescript|javascript|\bts\b|\bjs\b)\s*\n', response, _re.IGNORECASE)
+        # 检测非 Python 语言标记
+        lang_block = re.search(r'```(typescript|javascript|\bts\b|\bjs\b)\s*\n', response, re.IGNORECASE)
         if lang_block:
-            raise ValueError(f"LLM返回了{lang_block.group(1)}代码，期望Python。请检查prompt语言约束")
-        # 无标记，检查内容是否像Python
+            raise ValueError(f"LLM返回了{lang_block.group(1)}代码，期望Python")
+        # 无标记，检查内容是否像 Python
         stripped = response.strip()
         python_indicators = ['def test_', 'import pytest', 'from playwright.sync_api',
                              'from appium', 'import requests', 'import httpx', 'def ', 'import ']

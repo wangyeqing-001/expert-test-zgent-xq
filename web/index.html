@@ -819,21 +819,34 @@
             showLoading('gen-btn', 'gen-result');
 
             try {
-                const body = {};
+                let data;
                 if (taskId) {
-                    body.task_id = taskId;
+                    // task_id 路径：走异步生成 + 轮询
+                    const submitResp = await fetch('/api/generate_async', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({task_id: taskId})
+                    });
+                    const submitData = await submitResp.json();
+                    if (!submitData.success) {
+                        hideLoading('gen-btn', 'gen-result');
+                        showError('gen-result', submitData.error);
+                        return;
+                    }
+                    const genTaskId = submitData.gen_task_id;
+                    // 轮询状态
+                    data = await _pollGenerateStatus(genTaskId);
                 } else {
-                    body.requirement_doc = doc;
-                    body.query = query;
+                    // 老路径：自然语言 → 同步
+                    const body = {requirement_doc: doc, query: query};
+                    const response = await fetch('/api/generate', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(body)
+                    });
+                    data = await response.json();
                 }
 
-                const response = await fetch('/api/generate', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(body)
-                });
-
-                const data = await response.json();
                 hideLoading('gen-btn', 'gen-result');
 
                 if (data.success) {
@@ -847,6 +860,36 @@
             }
         }
 
+        // 轮询异步生成任务状态
+        async function _pollGenerateStatus(genTaskId) {
+            const MAX_WAIT = 600;  // 最多等 10 分钟
+            const INTERVAL = 5000; // 每 5 秒查一次
+            const startTime = Date.now();
+
+            while (Date.now() - startTime < MAX_WAIT * 1000) {
+                await new Promise(r => setTimeout(r, INTERVAL));
+                const resp = await fetch(`/api/generate_status?gen_task_id=${encodeURIComponent(genTaskId)}`);
+                const s = await resp.json();
+
+                // 更新进度显示
+                const resultDiv = document.getElementById('gen-result');
+                const progressHtml = `
+                    <div style="padding:12px;background:#e6f7ff;border-radius:6px;border:1px solid #91d5ff;color:#0958d9;margin-bottom:12px">
+                        ⏳ 生成中... ${s.progress}/${s.total} 批已完成
+                        ${s.logs && s.logs.length ? '<div style="font-size:12px;color:#595959;margin-top:6px">最近: ' + s.logs.map(l => l.text).join(' | ') + '</div>' : ''}
+                    </div>`;
+                resultDiv.innerHTML = progressHtml;
+
+                if (s.status === 'completed') {
+                    return {success: true, ...s.result};
+                } else if (s.status === 'failed') {
+                    return {success: false, error: s.error || '生成失败'};
+                }
+                // running / queued 继续轮询
+            }
+            return {success: false, error: '生成超时（10分钟），请稍后查看'};
+        }
+
         // 显示测试结果
         function displayGenerateResult(data) {
             const badge = document.getElementById('gen-badge');
@@ -855,8 +898,33 @@
 
             let html = '';
 
-            // task_id 批量模式：展示多文件 + 飞书链接
-            if (data.test_files && data.test_files.length > 1) {
+            // 新格式：task_id 路径返回 feishu_docs（按端分组的飞书文档列表）
+            if (data.feishu_docs && data.feishu_docs.length > 0) {
+                const totalCases = data.total_cases || 0;
+                html += `<div style="margin-bottom:15px;color:#495057">
+                    <strong>共生成 ${totalCases} 条测试用例，整合为 ${data.feishu_docs.length} 个飞书文档</strong>
+                </div>`;
+                for (const doc of data.feishu_docs) {
+                    const group = doc.group || '';
+                    const count = doc.case_count || 0;
+                    const link = doc.feishu_url
+                        ? `<a href="${doc.feishu_url}" target="_blank" style="color:#1890ff;font-size:13px;text-decoration:none">📄 查看飞书文档</a>`
+                        : `<span style="color:#ff4d4f;font-size:13px">${doc.error || '文档创建失败'}</span>`;
+                    html += `<div style="padding:12px 14px;margin-bottom:8px;background:#f9f9f9;border-radius:6px;border:1px solid #e8e8e8">
+                        <strong>${group}</strong> — ${count} 条用例 &nbsp;&nbsp;${link}
+                    </div>`;
+                }
+                // 批次明细
+                if (data.batch_results && data.batch_results.length > 0) {
+                    html += `<details style="margin-top:12px"><summary style="cursor:pointer;color:#8c8c8c;font-size:13px">批次明细（${data.batch_results.length} 批）</summary>`;
+                    html += `<div style="margin-top:8px;font-size:12px;color:#8c8c8c">`;
+                    for (const br of data.batch_results) {
+                        html += `${br.platform_label || br.platform} 第${br.batch_index}批: ${br.case_count} 条<br>`;
+                    }
+                    html += `</div></details>`;
+                }
+            } else if (data.test_files && data.test_files.length > 1) {
+                // 兼容旧格式：多文件
                 html += `<div style="margin-bottom:15px;color:#495057">
                     <strong>共生成 ${data.test_files.length} 个文件（${data.total_batches || data.test_files.length} 批）</strong>
                 </div>`;
@@ -870,15 +938,6 @@
                         <strong>${label} 第${idx}批</strong> — <code style="font-size:12px">${f.path}</code>${feishuLink}
                     </div>`;
                 }
-            } else if (data.test_files && data.test_files.length === 1) {
-                // 单文件但有飞书链接
-                const f = data.test_files[0];
-                const feishuLink = f.feishu_url
-                    ? `<br><a href="${f.feishu_url}" target="_blank" style="color:#1890ff;font-size:14px;text-decoration:none">📄 查看飞书文档</a>`
-                    : '';
-                html += `<p style="margin-bottom:15px;color:#495057">
-                    <strong>文件路径:</strong> ${f.path}${feishuLink}
-                </p>`;
             } else {
                 // 老路径单文件
                 const feishuLink = data.feishu_url

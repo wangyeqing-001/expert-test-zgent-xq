@@ -108,18 +108,20 @@ class AgentOrchestrator:
         batches = point_result.get('batches', [])
 
         if batches:
-            # 新链路：子端分组 + 同端内分批，按端 prompt 路由
+            # 新链路：子端分组 + 同端内分批，按端 prompt 路由 → JSON 测试用例
             if not generate_all:
                 batches = [b for b in batches if b.get('priority') == 'P0']
                 print(f"仅生成高优先级批次 ({len(batches)}批)")
+            all_cases = []
             for i, batch in enumerate(batches, 1):
                 print(f"\n  [{i}/{len(batches)}] {b.get('platform_label', batch.get('platform'))} · 第{batch.get('batch_index')}批 ({len(batch.get('test_points', []))}个测试点)")
                 try:
                     result = self.test_generator.execute_batch(batch)
-                    generated_files.append(result['file_path'])
+                    all_cases.extend(result.get('test_cases', []))
                 except Exception as e:
                     print(f"  ✗ 生成失败: {e}")
                     self._log_step('TestGenerator', {'status': 'failed', 'error': str(e)})
+            generated_files.append(f"(JSON 测试用例 {len(all_cases)} 条)")
         else:
             # 旧链路（code/降级）：逐 scenario 调 execute
             if not generate_all:
@@ -132,7 +134,7 @@ class AgentOrchestrator:
                         'scenario': scenario,
                         'source_file': file_path
                     })
-                    generated_files.append(result['file_path'])
+                    generated_files.append(result.get('file_path', ''))
                 except Exception as e:
                     print(f"  ✗ 生成失败: {e}")
                     self._log_step('TestGenerator', {'status': 'failed', 'error': str(e)})

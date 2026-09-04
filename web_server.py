@@ -93,6 +93,11 @@ gen_agent = TestGeneratorAgent(api_key=api_key, base_url=base_url, test_type='we
 # Agent调用锁（防止并发请求竞态修改Agent内部state）
 _agent_lock = threading.Lock()
 
+# ---- 异步生成任务状态 ----
+# task_id → {status, progress, total, result, error, created_at, started_at, finished_at, logs}
+_generation_tasks: dict[str, dict] = {}
+_generation_tasks_lock = threading.Lock()
+
 # ---- YAPI 接口详情拉取 ----
 YAPI_INTERFACE_API = 'https://ugcqams.snowballfinance.com/internal/getInterfaceData'
 _YAPI_ID_RE = re.compile(r'/interface/api/(\d+)')
@@ -342,6 +347,26 @@ def generate_test_points():
                     'analysis_doc_url': matched_item.get('feishu_url', '') if matched_item else '',
                     'yapi_interfaces': yapi_interfaces,
                 })
+
+            # 把测试点 JSON 路径 + 测试点飞书文档 URL 写回 history，供 /api/generate task_id 查找
+            json_path = result.get('json_path')
+            testpoint_feishu_url = result.get('feishu_url', '')
+            if json_path and matched_item:
+                try:
+                    with _history_lock:
+                        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                            hist_items = json.load(f)
+                        for hi in hist_items:
+                            if hi.get('task_id') == task_id:
+                                hi['testpoints_json'] = json_path
+                                if testpoint_feishu_url:
+                                    hi['testpoint_feishu_url'] = testpoint_feishu_url
+                                break
+                        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                            json.dump(hist_items, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logger.warning(f"写回 testpoints_json 到 history 失败: {e}")
+
             return jsonify({
                 'success': True,
                 'task_id': task_id,
@@ -350,7 +375,7 @@ def generate_test_points():
                 'batches': result.get('batches', []),
                 'feishu_url': result.get('feishu_url'),
                 'local_path': result.get('local_path'),
-                'json_path': result.get('json_path'),
+                'json_path': json_path,
             })
 
         # Debug: 直接传 prd_url 或 raw_prd 跳过需求分析
@@ -413,12 +438,230 @@ def generate_test_points():
         return jsonify({'error': str(e)}), 500
 
 
+def _run_generate_in_background(task_id: str, payload: dict):
+    """后台线程中执行测试用例生成，结果写入 _generation_tasks"""
+    # 标记为 running
+    with _generation_tasks_lock:
+        task = _generation_tasks.setdefault(task_id, {
+            'status': 'running', 'progress': 0, 'total': 0,
+            'result': None, 'error': None,
+            'created_at': payload.get('_created_at', ''),
+            'started_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'finished_at': None,
+            'logs': [],
+        })
+        # 覆盖 queued → running
+        task['status'] = 'running'
+        task['started_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        task_id_in = payload.get('task_id', '')
+        # ---- 复用 /api/generate 中 task_id 路径的全部逻辑 ----
+        # 从 history 查找测试点 JSON + 需求文档
+        tp_json_path = None
+        req_md_path = None
+        source_doc_url = ''
+        analysis_doc_url = ''
+        testpoint_doc_url = ''
+        req_title = ''
+        try:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                items = json.load(f)
+            for it in items:
+                if it.get('task_id') == task_id_in:
+                    tp_json_path = it.get('testpoints_json')
+                    req_md_path = it.get('local_path')
+                    source_doc_url = it.get('source_doc_url', '')
+                    analysis_doc_url = it.get('feishu_url', '')
+                    testpoint_doc_url = it.get('testpoint_feishu_url', '')
+                    req_title = it.get('source_title', '')
+                    break
+        except Exception:
+            pass
+
+        if not tp_json_path or not os.path.exists(tp_json_path):
+            task['status'] = 'failed'
+            task['error'] = f'任务 {task_id_in} 未找到测试点JSON'
+            task['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            return
+
+        with open(tp_json_path, 'r', encoding='utf-8') as f:
+            tp_data = json.load(f)
+        batches = tp_data.get('batches', [])
+
+        # 加载需求文档
+        requirement_context = '（无）'
+        if req_md_path and os.path.exists(req_md_path):
+            try:
+                with open(req_md_path, 'r', encoding='utf-8') as f:
+                    requirement_context = f.read()[:8000]
+            except Exception:
+                pass
+
+        # 大批次拆小
+        _SPLIT_THRESHOLD = {}
+        flattened_batches = []
+        for batch in batches:
+            platform = batch.get('platform', 'common')
+            pts = batch.get('test_points', [])
+            threshold = _SPLIT_THRESHOLD.get(platform)
+            if threshold and len(pts) > threshold:
+                for sub_idx in range(0, len(pts), threshold):
+                    sub_batch = dict(batch)
+                    sub_batch['test_points'] = pts[sub_idx:sub_idx + threshold]
+                    orig_bi = batch.get('batch_index', 1)
+                    sub_batch['batch_index'] = f"{orig_bi}.{sub_idx // threshold + 1}"
+                    flattened_batches.append(sub_batch)
+            else:
+                flattened_batches.append(batch)
+
+        total = len(flattened_batches)
+        with _generation_tasks_lock:
+            task['total'] = total
+
+        all_results = []
+        for i, batch in enumerate(flattened_batches):
+            try:
+                sc = batch.get('shared_context') or {}
+                sc['requirement_context'] = requirement_context
+                batch['shared_context'] = sc
+                with _agent_lock:
+                    result = gen_agent.execute_batch(batch)
+                all_results.append(result)
+            except Exception as e:
+                logger.error(f"batch生成失败 [{batch.get('platform', '')}-{batch.get('batch_index', 1)}]: {e}")
+            with _generation_tasks_lock:
+                task['progress'] = i + 1
+                task['logs'].append({
+                    'ts': datetime.now().strftime('%H:%M:%S'),
+                    'text': f"[{batch.get('platform_label', '')}] batch#{batch.get('batch_index', 1)} → "
+                            f"{all_results[-1]['test_cases'] if all_results else '0'}条"
+                })
+
+        # 按端分组 → 飞书文档
+        from agents.test_generator.agent import _PLATFORM_FOLDER_MAP, _PLATFORM_GROUP_LABEL
+        by_group: dict[str, list] = {}
+        group_platforms: dict[str, str] = {}
+        for r in all_results:
+            platform = r.get('platform', 'common')
+            group_label = _PLATFORM_GROUP_LABEL.get(platform, '其他')
+            by_group.setdefault(group_label, []).extend(r.get('test_cases', []))
+            group_platforms.setdefault(group_label, platform)
+
+        feishu_docs = []
+        if feishu_client:
+            for group_label, cases in by_group.items():
+                if not cases:
+                    continue
+                platform = group_platforms[group_label]
+                folder_token = _PLATFORM_FOLDER_MAP.get(platform)
+                if not folder_token:
+                    continue
+                struct_nodes = []
+                if source_doc_url:
+                    struct_nodes.append({'type': 'paragraph', 'text': f'需求文档链接：[点击查看]({source_doc_url})'})
+                if analysis_doc_url:
+                    struct_nodes.append({'type': 'paragraph', 'text': f'需求分析：[点击查看]({analysis_doc_url})'})
+                if testpoint_doc_url:
+                    struct_nodes.append({'type': 'paragraph', 'text': f'测试点分析：[点击查看]({testpoint_doc_url})'})
+                struct_nodes.extend(gen_agent.cases_to_feishu_struct(cases, group_label))
+                safe_title = (req_title or task_id_in).replace('|', '-').strip()
+                try:
+                    doc_result = feishu_client.create_doc_from_struct(
+                        title=f"【{safe_title}】{group_label}测试用例",
+                        folder_token=folder_token,
+                        struct_blocks=struct_nodes
+                    )
+                    feishu_docs.append({'group': group_label, 'platform': platform,
+                                        'feishu_url': doc_result['url'], 'case_count': len(cases)})
+                except Exception as e:
+                    logger.error(f"[{group_label}] 飞书文档创建失败: {e}")
+
+        total_cases = sum(len(r.get('test_cases', [])) for r in all_results)
+        with _generation_tasks_lock:
+            task['status'] = 'completed'
+            task['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            task['result'] = {
+                'total_cases': total_cases,
+                'feishu_docs': feishu_docs,
+                'batch_results': [
+                    {'platform': r.get('platform', ''),
+                     'platform_label': r.get('platform_label', ''),
+                     'batch_index': r.get('batch_index', 1),
+                     'case_count': len(r.get('test_cases', []))}
+                    for r in all_results
+                ],
+            }
+
+    except Exception as e:
+        logger.error(f"后台生成任务异常: {e}")
+        with _generation_tasks_lock:
+            task['status'] = 'failed'
+            task['error'] = str(e)[:500]
+            task['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+@app.route('/api/generate_async', methods=['POST'])
+def generate_test_async():
+    """异步测试生成接口：立即返回 task_id，后台线程执行"""
+    data = request.json or {}
+    task_id_in = data.get('task_id', '')
+    if not task_id_in:
+        return jsonify({'error': '缺少 task_id'}), 400
+
+    new_task_id = f"GEN-{task_id_in}-{datetime.now().strftime('%H%M%S')}"
+    with _generation_tasks_lock:
+        _generation_tasks[new_task_id] = {
+            'status': 'queued', 'progress': 0, 'total': 0,
+            'result': None, 'error': None,
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'started_at': None, 'finished_at': None, 'logs': [],
+        }
+
+    payload = {'task_id': task_id_in, '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    t = threading.Thread(target=_run_generate_in_background, args=(new_task_id, payload), daemon=True)
+    t.start()
+
+    return jsonify({'success': True, 'gen_task_id': new_task_id, 'status': 'queued'})
+
+
+@app.route('/api/generate_status', methods=['GET'])
+def generate_test_status():
+    """查询异步生成任务状态"""
+    gen_task_id = request.args.get('gen_task_id', '')
+    if not gen_task_id:
+        return jsonify({'error': '缺少 gen_task_id'}), 400
+
+    with _generation_tasks_lock:
+        task = _generation_tasks.get(gen_task_id)
+    if not task:
+        return jsonify({'error': '任务不存在'}), 404
+
+    # 清理旧任务（超过 30 分钟的保留 dict 但只返回摘要）
+    resp = {
+        'gen_task_id': gen_task_id,
+        'status': task['status'],
+        'progress': task['progress'],
+        'total': task['total'],
+        'created_at': task.get('created_at'),
+        'started_at': task.get('started_at'),
+        'finished_at': task.get('finished_at'),
+    }
+    if task['status'] == 'completed' and task.get('result'):
+        resp['result'] = task['result']
+    elif task['status'] == 'failed':
+        resp['error'] = task.get('error', '')
+    # 只返回最近 20 条日志
+    resp['logs'] = task.get('logs', [])[-20:]
+    return jsonify(resp)
+
+
 @app.route('/api/generate', methods=['POST'])
 def generate_test():
-    """测试生成接口 - Step3: 测试场景→测试代码
+    """测试生成接口 - Step3: 测试点 → JSON 测试用例 → 整合写入飞书文档
     支持两种入口：
-    1. task_id: 从 generated_testpoints JSON 加载 batches → execute_batch 逐批生成
-    2. query + requirement_doc: 自然语言 → process_query（老路径）
+    1. task_id: 从 generated_testpoints JSON 加载 batches → execute_batch 逐批生成 → 按端整合为飞书文档
+    2. query + requirement_doc: 自然语言 → process_query（老路径，保留兼容）
     """
     try:
         data = request.json
@@ -427,28 +670,40 @@ def generate_test():
         requirement_doc = data.get('requirement_doc', '')
         context = data.get('context', {})
 
-        # ---- task_id 路径：从测试点 JSON 加载 batches 逐批生成 ----
+        # ---- task_id 路径：从测试点 JSON 加载 batches 逐批生成 → 整合飞书 ----
         if task_id:
-            # 从 history 找到该 task_id 对应的测试点 JSON 路径
+            # 从 history 找到该 task_id 对应的测试点 JSON 路径 + 需求分析文档
             tp_json_path = None
+            req_md_path = None
+            source_doc_url = ''
+            analysis_doc_url = ''
+            req_title = ''
             try:
                 with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
                     items = json.load(f)
                 for it in items:
                     if it.get('task_id') == task_id:
                         tp_json_path = it.get('testpoints_json')
+                        req_md_path = it.get('local_path')
+                        source_doc_url = it.get('source_doc_url', '')
+                        analysis_doc_url = it.get('feishu_url', '')
+                        req_title = it.get('source_title', '')
                         break
             except Exception as e:
                 logger.warning(f"task_id 查找测试点JSON失败: {e}")
 
-            # 兜底：按 task_id 中的日期前缀在 generated_testpoints/ 目录搜索
+            # 兜底：按 task_id 中的时间戳在 generated_testpoints/ 目录搜索
             if not tp_json_path:
                 tp_dir = 'generated_testpoints'
-                if os.path.isdir(tp_dir):
-                    for fn in sorted(os.listdir(tp_dir), reverse=True):
-                        if fn.endswith('.json') and task_id.split('-')[-1][:6] in fn:
-                            tp_json_path = os.path.join(tp_dir, fn)
-                            break
+                parts = task_id.split('-')
+                if len(parts) >= 3:
+                    date_part = parts[1]
+                    time_part = parts[2]
+                    if os.path.isdir(tp_dir):
+                        for fn in sorted(os.listdir(tp_dir), reverse=True):
+                            if fn.endswith('.json') and date_part in fn and time_part in fn:
+                                tp_json_path = os.path.join(tp_dir, fn)
+                                break
 
             if not tp_json_path or not os.path.exists(tp_json_path):
                 return jsonify({'error': f'任务 {task_id} 未找到测试点JSON，请先生成测试点'}), 404
@@ -459,31 +714,156 @@ def generate_test():
             if not batches:
                 return jsonify({'error': '测试点JSON中无batches数据'}), 400
 
-            logger.info(f"task_id={task_id}, 加载测试点 {tp_data.get('total', 0)}个/{len(batches)}批 → 开始生成测试代码")
-            generated_files = []
+            # 加载需求分析文档全文，注入到每批 shared_context.requirement_context
+            requirement_context = '（无）'
+            if req_md_path and os.path.exists(req_md_path):
+                try:
+                    with open(req_md_path, 'r', encoding='utf-8') as f:
+                        requirement_context = f.read()[:8000]  # 截断防 prompt 超长
+                    logger.info(f"加载需求分析文档 {len(requirement_context)} 字符作为 requirement_context")
+                except Exception as e:
+                    logger.warning(f"加载需求分析文档失败: {e}")
+
+            logger.info(f"task_id={task_id}, 加载测试点 {tp_data.get('total', 0)}个/{len(batches)}批 → 开始生成 JSON 测试用例")
+
+            # 大批次拆小：避免单批测试点过多导致 LLM 输出被截断或超时
+            # backend 每批最多 6 个点，admin 每批最多 5 个点，客户端保持原样
+            _SPLIT_THRESHOLD = {}
+            flattened_batches = []
+            for batch in batches:
+                platform = batch.get('platform', 'common')
+                pts = batch.get('test_points', [])
+                threshold = _SPLIT_THRESHOLD.get(platform)
+                if threshold and len(pts) > threshold:
+                    for sub_idx in range(0, len(pts), threshold):
+                        sub_pts = pts[sub_idx:sub_idx + threshold]
+                        sub_batch = dict(batch)
+                        sub_batch['test_points'] = sub_pts
+                        # 子 batch 序号标记为 {原序号}.{子序号}，便于日志追踪
+                        orig_bi = batch.get('batch_index', 1)
+                        sub_no = sub_idx // threshold + 1
+                        sub_batch['batch_index'] = f"{orig_bi}.{sub_no}"
+                        flattened_batches.append(sub_batch)
+                    logger.info(f"  拆批：{platform}-batch{batch.get('batch_index')} {len(pts)}点 → "
+                                f"{(len(pts)+threshold-1)//threshold} 个子批（每批≤{threshold}点）")
+                else:
+                    flattened_batches.append(batch)
+
+            # 逐批生成 JSON 测试用例
+            all_results = []
             with _agent_lock:
-                for batch in batches:
+                for batch in flattened_batches:
                     try:
+                        # 注入需求文档上下文
+                        sc = batch.get('shared_context') or {}
+                        sc['requirement_context'] = requirement_context
+                        batch['shared_context'] = sc
                         result = gen_agent.execute_batch(batch)
-                        generated_files.append({
-                            'path': result['file_path'],
-                            'platform': batch.get('platform', ''),
-                            'platform_label': batch.get('platform_label', ''),
-                            'batch_index': batch.get('batch_index', 1),
-                            'feishu_url': result.get('feishu_url', ''),
-                        })
+                        all_results.append(result)
                     except Exception as e:
                         logger.error(f"batch生成失败 [{batch.get('platform', '')}-{batch.get('batch_index', 1)}]: {e}")
+
+            if not all_results:
+                return jsonify({'error': '所有批次生成失败'}), 500
+
+            # 按端大类分组整合 → 飞书文档
+            # 客户端(app/web/h5/common/e2e) → 1 个文档 | backend → 1 个文档 | admin → 1 个文档
+            from agents.test_generator.agent import _PLATFORM_FOLDER_MAP, _PLATFORM_GROUP_LABEL
+            by_group: dict[str, list] = {}  # group_label → [test_cases...]
+            group_platforms: dict[str, str] = {}  # group_label → 代表 platform（用于取 folder_token）
+            for r in all_results:
+                platform = r.get('platform', 'common')
+                group_label = _PLATFORM_GROUP_LABEL.get(platform, '其他')
+                by_group.setdefault(group_label, []).extend(r.get('test_cases', []))
+                if group_label not in group_platforms:
+                    group_platforms[group_label] = platform
+
+            feishu_docs = []
+            if feishu_client:
+                # 测试点分析文档 URL（可选，从 history 或 tp_data 中获取）
+                testpoint_doc_url = ''
+                try:
+                    with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                        hist_items = json.load(f)
+                    for it in hist_items:
+                        if it.get('task_id') == task_id:
+                            testpoint_doc_url = it.get('testpoint_feishu_url', '')
+                            break
+                except Exception:
+                    pass
+                # 兜底：tp_data 里可能带 feishu_url
+                if not testpoint_doc_url and tp_data.get('feishu_url'):
+                    testpoint_doc_url = tp_data['feishu_url']
+
+                for group_label, cases in by_group.items():
+                    if not cases:
+                        continue
+                    platform = group_platforms[group_label]
+                    folder_token = _PLATFORM_FOLDER_MAP.get(platform)
+                    if not folder_token:
+                        logger.warning(f"未找到 {group_label} 对应的飞书文件夹 token，跳过")
+                        continue
+                    # 构建飞书 struct_nodes（对齐参考文档格式）
+                    struct_nodes = []
+                    # 溯源链接（格式匹配参考文档：p标签 + markdown链接）
+                    if source_doc_url:
+                        struct_nodes.append({'type': 'paragraph',
+                            'text': f'需求文档链接：[点击查看]({source_doc_url})'})
+                    if analysis_doc_url:
+                        struct_nodes.append({'type': 'paragraph',
+                            'text': f'需求分析：[点击查看]({analysis_doc_url})'})
+                    if testpoint_doc_url:
+                        struct_nodes.append({'type': 'paragraph',
+                            'text': f'测试点分析：[点击查看]({testpoint_doc_url})'})
+                    struct_nodes.extend(gen_agent.cases_to_feishu_struct(cases, group_label))
+                    # 文档标题：【{需求名称}】{组}测试用例
+                    safe_title = (req_title or task_id).replace('|', '-').strip()
+                    doc_title = f"【{safe_title}】{group_label}测试用例"
+                    try:
+                        result = feishu_client.create_doc_from_struct(
+                            title=doc_title,
+                            folder_token=folder_token,
+                            struct_blocks=struct_nodes
+                        )
+                        feishu_docs.append({
+                            'group': group_label,
+                            'platform': platform,
+                            'feishu_url': result['url'],
+                            'case_count': len(cases),
+                        })
+                        logger.info(f"[{group_label}] 飞书文档创建成功: {result['url']}")
+                    except Exception as e:
+                        logger.error(f"[{group_label}] 飞书文档创建失败: {e}")
+                        feishu_docs.append({
+                            'group': group_label,
+                            'platform': platform,
+                            'feishu_url': '',
+                            'case_count': len(cases),
+                            'error': str(e)[:200],
+                        })
+            else:
+                logger.warning("飞书客户端未配置，跳过文档创建")
+
+            total_cases = sum(len(r.get('test_cases', [])) for r in all_results)
+            logger.info(f"测试用例生成完成: 共 {total_cases} 条用例, {len(feishu_docs)} 个飞书文档")
 
             return jsonify({
                 'success': True,
                 'task_id': task_id,
-                'generated_files': [f['path'] for f in generated_files],
-                'test_files': generated_files,
+                'total_cases': total_cases,
                 'total_batches': len(batches),
+                'batch_results': [
+                    {
+                        'platform': r.get('platform', ''),
+                        'platform_label': r.get('platform_label', ''),
+                        'batch_index': r.get('batch_index', 1),
+                        'case_count': len(r.get('test_cases', [])),
+                    } for r in all_results
+                ],
+                'feishu_docs': feishu_docs,
             })
 
-        # ---- 自然语言路径（老路径） ----
+        # ---- 自然语言路径（老路径，保留兼容） ----
         full_query = query
         if requirement_doc:
             if query:
@@ -650,28 +1030,119 @@ def run_pipeline():
         scenarios = point_result['scenarios']
         logger.info(f"测试点生成: {len(scenarios)}个场景")
         
-        # Step3: 测试代码生成（优先按端 TestBatch 路由，无 batches 退回逐 scenario）
+        # Step3: 测试用例生成（JSON 输出 + 飞书文档整合）
         batches = point_result.get('batches', [])
-        generated_tests = []
+        all_test_cases = []
+        batch_meta = []
 
         if batches:
             if not generate_all:
                 batches = [b for b in batches if b.get('priority') == 'P0']
                 logger.info(f"仅生成高优先级批次 ({len(batches)}批)")
+
+            # 大批次拆小
+            _SPLIT_THRESHOLD_PIPE = {}
+            _pipe_batches = []
             for batch in batches:
-                try:
-                    gen_result = gen_agent.execute_batch(batch)
-                    with open(gen_result['file_path'], 'r', encoding='utf-8') as f:
-                        generated_tests.append({
-                            'path': gen_result['file_path'],
-                            'code': f.read(),
-                            'platform': gen_result.get('platform'),
+                platform = batch.get('platform', 'common')
+                pts = batch.get('test_points', [])
+                threshold = _SPLIT_THRESHOLD_PIPE.get(platform)
+                if threshold and len(pts) > threshold:
+                    for sub_idx in range(0, len(pts), threshold):
+                        sub_pts = pts[sub_idx:sub_idx + threshold]
+                        sub_batch = dict(batch)
+                        sub_batch['test_points'] = sub_pts
+                        orig_bi = batch.get('batch_index', 1)
+                        sub_no = sub_idx // threshold + 1
+                        sub_batch['batch_index'] = f"{orig_bi}.{sub_no}"
+                        _pipe_batches.append(sub_batch)
+                    logger.info(f"  拆批[pipeline]：{platform}-batch{batch.get('batch_index')} {len(pts)}点 → "
+                                f"{(len(pts)+threshold-1)//threshold} 个子批")
+                else:
+                    _pipe_batches.append(batch)
+
+            # 注入需求文档上下文
+            raw_prd_text = point_result.get('raw_prd', '')
+            for batch in _pipe_batches:
+                sc = batch.get('shared_context') or {}
+                sc['requirement_context'] = raw_prd_text[:8000] if raw_prd_text else '（无）'
+                batch['shared_context'] = sc
+
+            with _agent_lock:
+                for batch in _pipe_batches:
+                    try:
+                        gen_result = gen_agent.execute_batch(batch)
+                        platform = gen_result.get('platform', 'common')
+                        # 给每条用例打上 platform 标签，便于后续按端分组
+                        for tc in gen_result.get('test_cases', []):
+                            tc['_platform'] = platform
+                        all_test_cases.extend(gen_result.get('test_cases', []))
+                        batch_meta.append({
+                            'platform': platform,
                             'batch_index': gen_result.get('batch_index'),
+                            'case_count': len(gen_result.get('test_cases', [])),
                         })
-                except Exception as e:
-                    logger.warning(f"测试生成失败: {e}")
+                    except Exception as e:
+                        logger.warning(f"测试生成失败: {e}")
+
+            # 按端大类分组整合 → 飞书文档
+            feishu_docs = []
+            if feishu_client and all_test_cases:
+                from agents.test_generator.agent import _PLATFORM_FOLDER_MAP, _PLATFORM_GROUP_LABEL
+                by_group: dict[str, list] = {}
+                group_platforms: dict[str, str] = {}
+                for tc in all_test_cases:
+                    platform = tc.pop('_platform', 'common')
+                    group_label = _PLATFORM_GROUP_LABEL.get(platform, '其他')
+                    by_group.setdefault(group_label, []).append(tc)
+                    group_platforms.setdefault(group_label, platform)
+
+                source_url = (requirement_result or {}).get('metadata', {}).get('doc_url', '')
+                analysis_url = (requirement_result or {}).get('feishu_url', '')
+                req_title = (requirement_result or {}).get('metadata', {}).get('title', '') or '需求'
+
+                for group_label, cases in by_group.items():
+                    if not cases:
+                        continue
+                    platform = group_platforms.get(group_label, 'common')
+                    folder_token = _PLATFORM_FOLDER_MAP.get(platform)
+                    if not folder_token:
+                        continue
+                    struct_nodes = []
+                    if source_url:
+                        struct_nodes.append({'type': 'paragraph',
+                            'text': f'需求文档链接：[点击查看]({source_url})'})
+                    if analysis_url:
+                        struct_nodes.append({'type': 'paragraph',
+                            'text': f'需求分析：[点击查看]({analysis_url})'})
+                    struct_nodes.extend(gen_agent.cases_to_feishu_struct(cases, group_label))
+                    try:
+                        safe_title = (req_title or '需求').replace('|', '-').strip()
+                        doc_result = feishu_client.create_doc_from_struct(
+                            title=f"【{safe_title}】{group_label}测试用例",
+                            folder_token=folder_token,
+                            struct_blocks=struct_nodes
+                        )
+                        feishu_docs.append({'group': group_label, 'feishu_url': doc_result['url'], 'case_count': len(cases)})
+                    except Exception as e:
+                        logger.error(f"[{group_label}] 飞书文档创建失败: {e}")
+                        feishu_docs.append({'group': group_label, 'feishu_url': '', 'case_count': len(cases), 'error': str(e)[:200]})
+
+            return jsonify({
+                'success': True,
+                'total_cases': len(all_test_cases),
+                'batch_results': batch_meta,
+                'feishu_docs': feishu_docs,
+                'requirement': {
+                    'markdown': requirement_result.get('markdown') if requirement_result else None,
+                    'local_path': requirement_result.get('local_path') if requirement_result else None,
+                    'feishu_url': requirement_result.get('feishu_url') if requirement_result else None
+                },
+                'scenarios': scenarios
+            })
         else:
             # 旧链路（code/降级）：逐 scenario 调 process_query
+            generated_tests = []
             if not generate_all:
                 scenarios = [s for s in scenarios if s.get('priority') == 'high']
             for scenario in scenarios:
@@ -792,4 +1263,4 @@ if __name__ == '__main__':
     print(f"日志级别: INFO")
     print("="*50)
     logger.info(f"Web服务启动, 端口={args.port}")
-    app.run(host='0.0.0.0', port=args.port, debug=True, threaded=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=args.port, debug=False, threaded=True, use_reloader=False)
