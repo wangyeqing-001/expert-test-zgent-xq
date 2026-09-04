@@ -115,7 +115,12 @@ class RequirementAnalyzer(BaseAgent):
                 'markdown': markdown,
                 'local_path': local_path,
                 'feishu_url': feishu_url_out,
-                'raw_content': raw,  # 保留清洗后的 PRD 全文，供下游测试点生成使用
+                'raw_content': raw,
+                'metadata': {
+                    'source': 'prd_text',
+                    'title': doc_title,
+                    'doc_url': feishu_url or '',
+                },
             }
 
         # 4. 判断是否为代码文件路径
@@ -155,8 +160,10 @@ class RequirementAnalyzer(BaseAgent):
         # 在 markdown 尾部追加关联文档索引（LLM 分析已整合关联文档信息，索引提供原文回溯入口）
         if related_index:
             markdown = markdown.rstrip() + '\n\n' + self._build_related_index_md(related_index)
-            # blocks 末尾也追加关联文档索引节点
-            blocks = blocks + self._build_related_index_blocks(related_index)
+            # blocks 末尾也追加关联文档索引节点（blocks 为 None 时跳过，仅 markdown 降级）
+            related_blocks = self._build_related_index_blocks(related_index)
+            if blocks is not None:
+                blocks = blocks + related_blocks
         local_path, feishu_url = self._save_and_publish(markdown, doc_title, blocks)
 
         return {
@@ -165,6 +172,13 @@ class RequirementAnalyzer(BaseAgent):
             'feishu_url': feishu_url,
             'raw_content': fetched_related,
             'related_docs': related_index,
+            'metadata': {
+                'source': 'feishu_doc',
+                'title': doc_title,
+                'doc_url': doc_url,
+                'doc_type': doc_type,
+                'doc_token': doc_token,
+            },
         }
 
     # ==================== PRD 分析核心 ====================
@@ -338,7 +352,7 @@ class RequirementAnalyzer(BaseAgent):
             try:
                 doc_token, doc_type = FeishuClient.parse_doc_url(url)
                 title = self.feishu_client.get_doc_title(doc_token, doc_type) or '未命名文档'
-                doc_content = self.feishu_client.get_doc_content(doc_token, doc_type, doc_url=url)
+                doc_content = self.feishu_client.get_doc_content(doc_token, doc_type, doc_url=url, context='关联文档')
 
                 if not doc_content or not doc_content.strip():
                     print(f"[RequirementAnalyzer] 关联文档内容为空，跳过: {url}")

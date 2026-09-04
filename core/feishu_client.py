@@ -156,15 +156,17 @@ class FeishuClient:
             logger.error(f"请求飞书API失败: {str(e)}")
             raise
     
-    def get_doc_content(self, doc_token: str, doc_type: str = 'doc', doc_url: str = None) -> str:
+    def get_doc_content(self, doc_token: str, doc_type: str = 'doc', doc_url: str = None, context: str = '主文档') -> str:
         """
         获取飞书文档内容
         :param doc_token: 文档token（从URL中提取）
         :param doc_type: 文档类型 (doc/sheet/wiki)
         :param doc_url: 完整飞书文档URL（qadoc 优先用）
+        :param context: 调用上下文，用于日志区分 '主文档' / '关联文档'
         :return: 文档Markdown内容
         """
-        logger.info(f"开始获取文档内容, token={doc_token}, type={doc_type}")
+        log_prefix = f"[{context}]"
+        logger.info(f"{log_prefix} 开始获取内容, token={doc_token}, type={doc_type}")
 
         # 优先走 qadoc 内部网关（docx/wiki 支持，返回 Markdown + 关联文档 URL 不丢失）
         qadoc_doc_url = doc_url
@@ -179,30 +181,33 @@ class FeishuClient:
                 qadoc_result = self._qadoc_fetch(qadoc_doc_url)
                 if qadoc_result and qadoc_result['content']:
                     content = qadoc_result['content']
-                    logger.info(f"qadoc拉取成功, 长度={len(content)}字符")
+                    logger.info(f"{log_prefix} qadoc拉取成功, 长度={len(content)}字符")
                     # 缓存关联文档 URL 供 get_related_doc_urls 使用
-                    self._cached_related_urls = qadoc_result.get('related_urls', [])
+                    if context == '主文档':
+                        self._cached_related_urls = qadoc_result.get('related_urls', [])
                     return content
             except Exception as e:
-                logger.warning(f"qadoc拉取失败(重试后): {e}, 降级飞书OpenAPI")
+                logger.warning(f"{log_prefix} qadoc拉取失败(重试后): {e}, 降级飞书OpenAPI")
 
         # qadoc 降级：飞书 OpenAPI
-        logger.info(f"降级飞书OpenAPI, token={doc_token}, type={doc_type}")
+        logger.info(f"{log_prefix} 降级飞书OpenAPI, token={doc_token}, type={doc_type}")
         token = self.get_access_token()
         try:
             if doc_type == 'doc':
                 content = self._get_doc_text(doc_token, token)
             elif doc_type == 'sheet':
-                content = self._get_sheet_content(doc_token, token)
+                content = self._get_sheet_content(doc_token, token, context=context)
             elif doc_type == 'wiki':
                 content = self._get_wiki_content(doc_token, token)
             else:
                 raise ValueError(f"不支持的文档类型: {doc_type}")
 
-            logger.info(f"飞书OpenAPI拉取成功, 长度={len(content)}字符")
+            logger.info(f"{log_prefix} 飞书OpenAPI拉取成功, 长度={len(content)}字符")
             return content
         except Exception as e:
-            logger.error(f"获取文档内容失败: {str(e)}")
+            # 关联文档失败用 WARNING（不影响主流程），主文档失败用 ERROR
+            level = logger.warning if context != '主文档' else logger.error
+            level(f"{log_prefix} 获取内容失败: {str(e)}（不影响主文档分析，已跳过）" if context != '主文档' else f"{log_prefix} 获取内容失败: {str(e)}")
             raise
 
     def get_related_doc_urls(self, doc_token: str, doc_type: str = 'doc', doc_url: str = None) -> list:
@@ -372,9 +377,10 @@ class FeishuClient:
             raise
     
     @retry(max_retries=3)
-    def _get_sheet_content(self, sheet_token: str, token: str) -> str:
+    def _get_sheet_content(self, sheet_token: str, token: str, context: str = '主文档') -> str:
         """获取电子表格内容（简化版，返回CSV格式）"""
-        logger.debug(f"获取电子表格元数据, sheet_token={sheet_token}")
+        log_prefix = f"[{context}]"
+        logger.debug(f"{log_prefix} 获取电子表格元数据, sheet_token={sheet_token}")
         # 获取电子表格元数据
         meta_url = f"{self.base_url}/sheets/v2/spreadsheets/{sheet_token}"
         headers = {"Authorization": f"Bearer {token}"}
@@ -385,28 +391,28 @@ class FeishuClient:
             meta_data = meta_response.json()
             
             if meta_data.get('code') != 0:
-                error_msg = f"获取表格元数据失败: {meta_data.get('msg')}"
+                error_msg = f"{log_prefix} 获取表格元数据失败: {meta_data.get('msg')}"
                 logger.error(error_msg)
                 raise Exception(error_msg)
             
             # 简化处理：只获取第一个工作表
             sheets = meta_data['data']['sheets']
             if not sheets:
-                logger.warning("电子表格中没有工作表")
+                logger.warning(f"{log_prefix} 电子表格中没有工作表")
                 return ""
             
             sheet_id = sheets[0]['sheet_id']
-            logger.debug(f"获取到第一个工作表, sheet_id={sheet_id}")
+            logger.debug(f"{log_prefix} 获取到第一个工作表, sheet_id={sheet_id}")
             
             # 获取单元格数据
             range_url = f"{self.base_url}/sheets/v2/spreadsheets/{sheet_token}/values/{sheet_id}!A1:Z1000"
-            logger.debug(f"获取单元格数据, 范围=A1:Z1000")
+            logger.debug(f"{log_prefix} 获取单元格数据, 范围=A1:Z1000")
             range_response = self.session.get(range_url, headers=headers, timeout=10)
             range_response.raise_for_status()
             range_data = range_response.json()
             
             if range_data.get('code') != 0:
-                error_msg = f"获取表格数据失败: {range_data.get('msg')}"
+                error_msg = f"{log_prefix} 获取表格数据失败: {range_data.get('msg')}"
                 logger.error(error_msg)
                 raise Exception(error_msg)
             
@@ -417,10 +423,12 @@ class FeishuClient:
                 csv_lines.append(','.join(str(cell) for cell in row))
             
             result = '\n'.join(csv_lines)
-            logger.debug(f"成功转换表格为CSV格式, 行数={len(csv_lines)}")
+            logger.debug(f"{log_prefix} 成功转换表格为CSV格式, 行数={len(csv_lines)}")
             return result
         except requests.exceptions.RequestException as e:
-            logger.error(f"请求飞书表格API失败: {str(e)}")
+            # 关联文档的表格失败 → WARNING（不影响主流程）
+            level = logger.warning if context != '主文档' else logger.error
+            level(f"{log_prefix} 请求飞书表格API失败: {str(e)}（不影响主文档分析，已跳过）" if context != '主文档' else f"{log_prefix} 请求飞书表格API失败: {str(e)}")
             raise
     
     @retry(max_retries=3)

@@ -20,6 +20,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def clean_control_chars(text: str) -> str:
+    """清理 JSON 字符串中会导致前端 JSON.parse 失败的非法控制字符（保留 \n \r \t）"""
+    if not text:
+        return ''
+    return ''.join(
+        ch for ch in text
+        if ch in ('\n', '\r', '\t') or ord(ch) >= 32
+    )
+
+
 # ---- 实时日志缓冲（供前端 /api/logs 增量拉取，展示在页面底部）----
 _log_buffer = deque(maxlen=500)
 _log_seq = 0
@@ -135,11 +146,21 @@ def analyze_requirement():
         # 持久化历史记录：原始需求文档链接 + 生成的需求分析飞书文档链接
         meta = result.get('metadata') or {}
         task_id = f"REQ-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        # 标题/URL 优先级：后端 metadata（最准）> 前端 doc_title/doc_url > query 截断
+        final_title = (meta.get('title') or doc_title or '').strip()
+        final_doc_url = (meta.get('doc_url') or doc_url or '').strip()
+        if not final_title:
+            # 尝试从 feishu 生成文档名反推：如 "xxx-需求分析" → 取 xxx
+            gen_title = result.get('feishu_title', '')
+            if gen_title and gen_title.endswith('-需求分析'):
+                final_title = gen_title.replace('-需求分析', '')
+            else:
+                final_title = query[:30]
         _append_history({
             'task_id': task_id,
             'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'source_doc_url': meta.get('doc_url', ''),
-            'source_title': doc_title or meta.get('title') or query[:30],
+            'source_doc_url': final_doc_url,
+            'source_title': final_title,
             'feishu_url': result.get('feishu_url'),
             'local_path': result.get('local_path'),
         })
@@ -317,16 +338,22 @@ def get_status():
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
-    """需求分析历史记录列表（前端展示可点击的原始/生成文档链接）"""
+    """需求分析历史记录列表（支持分页：limit + offset）"""
     try:
         items = []
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
                 items = json.load(f)
-        return jsonify({'items': items})
+        total = len(items)
+        # 分页参数
+        limit = request.args.get('limit', type=int)
+        offset = request.args.get('offset', default=0, type=int)
+        if limit is not None:
+            items = items[offset:offset + limit]
+        return jsonify({'items': items, 'total': total})
     except Exception as e:
         logger.warning(f"读取历史记录失败: {e}")
-        return jsonify({'items': []})
+        return jsonify({'items': [], 'total': 0})
 
 
 @app.route('/api/logs')
@@ -526,10 +553,10 @@ def parse_feishu_doc():
 
         return jsonify({
             'success': True,
-            'content': content,
+            'content': clean_control_chars(content),
             'doc_type': doc_type,
             'doc_token': doc_token,
-            'title': doc_title
+            'title': clean_control_chars(doc_title)
         })
     
     except ValueError as e:

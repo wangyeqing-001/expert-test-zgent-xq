@@ -189,6 +189,18 @@
             color: #667eea;
             word-break: break-all;
         }
+        .history-task-id {
+            display: inline-block;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11px;
+            color: #888;
+            background: #eee;
+            padding: 2px 7px;
+            border-radius: 10px;
+            line-height: 1;
+            letter-spacing: 0.2px;
+            user-select: all;
+        }
 
         .scenario-priority {
             display: inline-block;
@@ -582,14 +594,27 @@
                     body: JSON.stringify({query, doc_title: docTitle, doc_url: docUrl})
                 });
 
-                const data = await response.json();
+                let data;
+                try {
+                    const rawText = await response.text();
+                    data = JSON.parse(rawText);
+                } catch (parseErr) {
+                    hideLoading('req-btn', 'req-result');
+                    showError('req-result', `服务器响应解析失败: ${parseErr.message.slice(0, 80)}`);
+                    return;
+                }
                 hideLoading('req-btn', 'req-result');
+
+                if (!response.ok) {
+                    showError('req-result', data.error || `HTTP ${response.status}`);
+                    return;
+                }
 
                 if (data.success) {
                     displayRequirementResult(data);
                     loadHistory();  // 刷新历史记录
                 } else {
-                    showError('req-result', data.error);
+                    showError('req-result', data.error || '未知错误');
                 }
             } catch (error) {
                 hideLoading('req-btn', 'req-result');
@@ -648,42 +673,87 @@
             if (data.task_id) document.getElementById('tp-task-id').value = data.task_id;
             setTimeout(() => generateTestPoints(), 300);
         }
-        }
 
         // 加载需求分析历史记录（原始需求文档链接 + 生成的需求分析飞书文档链接，可点击打开）
+        // 历史记录分页状态
+        const HISTORY_INITIAL = 3;   // 首次默认展示
+        const HISTORY_PAGE_SIZE = 5; // 每次加载更多追加
+        let historyLoaded = 0;       // 已加载条数
+        let historyTotal = 0;        // 后端总条数
+
+        function renderHistoryItem(it) {
+            const time = it.created_at || '';
+            const src = it.source_doc_url
+                ? `<a href="${it.source_doc_url}" target="_blank" class="history-link">原始需求文档</a>`
+                : '<span style="color:#6c757d">文本/代码输入</span>';
+            const gen = it.feishu_url
+                ? `<a href="${it.feishu_url}" target="_blank" class="history-link">需求分析文档</a>`
+                : '<span style="color:#dc3545">未生成</span>';
+            const taskTag = it.task_id
+                ? `<span class="history-task-id" title="点击复制" onclick="navigator.clipboard.writeText('${it.task_id}')">${it.task_id}</span>`
+                : '';
+            return `<li class="history-item">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+                    <strong style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(it.source_title || '未命名')}</strong>
+                    <small style="color:#999;flex-shrink:0">${time}</small>
+                </div>
+                <div style="margin-top:6px;font-size:13px;display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+                    <span>📄 来源: ${src}</span>
+                    <span>✨ 生成: ${gen}</span>
+                    <span style="flex:1"></span>
+                    ${taskTag}
+                </div>
+            </li>`;
+        }
+
         async function loadHistory() {
+            const box = document.getElementById('req-history-content');
             try {
-                const resp = await fetch('/api/history');
+                const resp = await fetch(`/api/history?limit=${HISTORY_INITIAL}&offset=0`);
                 const data = await resp.json();
-                const box = document.getElementById('req-history-content');
+                historyTotal = data.total || 0;
+                historyLoaded = (data.items || []).length;
                 if (!data.items || !data.items.length) {
                     box.innerHTML = '<p style="color:#6c757d;padding:10px">暂无历史记录</p>';
                     return;
                 }
                 let html = '<ul class="history-list">';
-                data.items.forEach(it => {
-                    const time = it.created_at || '';
-                    const src = it.source_doc_url
-                        ? `<a href="${it.source_doc_url}" target="_blank" class="history-link">原始需求文档</a>`
-                        : '<span style="color:#6c757d">文本/代码输入</span>';
-                    const gen = it.feishu_url
-                        ? `<a href="${it.feishu_url}" target="_blank" class="history-link">需求分析文档</a>`
-                        : '<span style="color:#dc3545">未生成</span>';
-                    html += `<li class="history-item">
-                        <div style="display:flex;justify-content:space-between;align-items:center">
-                            <strong>${escapeHtml(it.source_title || '未命名')}</strong>
-                            <small style="color:#6c757d">${time}</small>
-                        </div>
-                        <div style="margin-top:6px;font-size:13px">
-                            <span style="margin-right:20px">📄 来源: ${src}</span>
-                            <span>✨ 生成: ${gen}</span>
-                        </div>
-                    </li>`;
-                });
+                data.items.forEach(it => { html += renderHistoryItem(it); });
                 html += '</ul>';
+                // 加载更多按钮
+                if (historyLoaded < historyTotal) {
+                    html += `<div style="text-align:center;margin-top:10px">
+                        <button class="btn" id="history-load-more" onclick="loadMoreHistory()" style="background:#667eea">加载更多</button>
+                    </div>`;
+                }
                 box.innerHTML = html;
             } catch (e) {
-                document.getElementById('req-history-content').innerHTML = '<p style="color:#dc3545;padding:10px">历史记录加载失败</p>';
+                box.innerHTML = '<p style="color:#dc3545;padding:10px">历史记录加载失败</p>';
+            }
+        }
+
+        async function loadMoreHistory() {
+            const btn = document.getElementById('history-load-more');
+            if (btn) { btn.disabled = true; btn.textContent = '加载中...'; }
+            try {
+                const resp = await fetch(`/api/history?limit=${HISTORY_PAGE_SIZE}&offset=${historyLoaded}`);
+                const data = await resp.json();
+                historyTotal = data.total || 0;
+                const ul = document.querySelector('#req-history-content .history-list');
+                if (ul && data.items) {
+                    data.items.forEach(it => {
+                        ul.insertAdjacentHTML('beforeend', renderHistoryItem(it));
+                    });
+                    historyLoaded += data.items.length;
+                }
+                // 更新或移除按钮
+                if (historyLoaded >= historyTotal) {
+                    if (btn) btn.parentElement.remove();
+                } else {
+                    if (btn) { btn.disabled = false; btn.textContent = '加载更多'; }
+                }
+            } catch (e) {
+                if (btn) { btn.disabled = false; btn.textContent = '加载更多'; }
             }
         }
 
@@ -829,7 +899,16 @@
                     body: JSON.stringify({doc_url: docUrl})
                 });
 
-                const data = await response.json();
+                let data;
+                try {
+                    const rawText = await response.text();
+                    data = JSON.parse(rawText);
+                } catch (parseErr) {
+                    btn.disabled = false;
+                    btn.textContent = '导入';
+                    alert('服务器返回格式异常: ' + (parseErr.message || parseErr).slice(0, 80));
+                    return;
+                }
                 btn.disabled = false;
                 btn.textContent = '导入';
 
@@ -840,7 +919,7 @@
                     // 显示成功提示
                     showImportNotice('feishu-url', `✓ 成功导入飞书${data.doc_type === 'doc' ? '文档' : data.doc_type === 'wiki' ? '知识库' : '表格'} (${data.content.length} 字符)`);
                 } else {
-                    alert('导入失败: ' + data.error);
+                    alert('导入失败: ' + (data.error || '未知错误'));
                 }
             } catch (error) {
                 btn.disabled = false;
@@ -868,7 +947,16 @@
                     body: JSON.stringify({doc_url: docUrl})
                 });
 
-                const data = await response.json();
+                let data;
+                try {
+                    const rawText = await response.text();
+                    data = JSON.parse(rawText);
+                } catch (parseErr) {
+                    btn.disabled = false;
+                    btn.textContent = '导入';
+                    alert('服务器返回格式异常: ' + (parseErr.message || parseErr).slice(0, 80));
+                    return;
+                }
                 btn.disabled = false;
                 btn.textContent = '导入';
 
@@ -884,7 +972,7 @@
                     const titlePart = data.title ? `《${data.title}》` : '';
                     showImportNotice('feishu-url-req', `✓ 成功导入飞书${typeLabel} ${titlePart} (${content.length} 字符)`);
                 } else {
-                    alert('导入失败: ' + data.error);
+                    alert('导入失败: ' + (data.error || '未知错误'));
                 }
             } catch (error) {
                 btn.disabled = false;
