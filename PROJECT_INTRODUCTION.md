@@ -11,6 +11,12 @@
 - **完整ReAct实现**：思考(Reasoning) + 行动(Acting)循环，包含记忆、工具、规划、反思四大模块
 - **飞书文档全链路集成**：需求分析与测试点均自动写入飞书文档（结构化JSON直写原生块），测试点文档含溯源链接（需求文档+需求分析飞书链接），支持在线协作评审
 - **测试点扁平JSON架构**：AI输出扁平数组（每条带scope字段，7选1），代码自动按scope→platform映射分组+分批；PRD直提（原始需求主材料+约束清单辅助门控）与代码分析双链路并行
+- **JSON测试用例自动生成**：TestGenerator按 platform 路由3类 prompt，每条测试点生成≥3条（P0/P1）或≥2条（P2）JSON测试用例（含test_module/test_point/test_scenario/test_data/test_steps/expected_results/priority/status/remarks 9字段），按 test_module 分组后 H1→H2→6列表格写入飞书
+- **按端大类整合飞书文档**：客户端(App/Web/H5/通用/E2E)自动合并为1个文档存入客户端文件夹，backend→后端文件夹，admin→后台文件夹；task最多生成3个飞书文档（视需求覆盖端而定）
+- **异步生成 + 前端轮询**：新增 `/api/generate_async`（提交立即返回gen_task_id，后台线程执行）+ `/api/generate_status`（轮询进度/日志/结果）；前端提交后轮询进度面板（x/y批 + 最近日志），避免Flask worker被长耗时请求占用
+- **LLM截断自适应策略**：`_is_truncated` 检测JSON闭合/代码块闭合/结尾断句；截断后**递归拆子批**（binary split）而非翻倍max_tokens，最小粒度2点，最大深度4层；安全断言 `_MAX_POINTS_PER_BATCH=5` 兜底
+- **Token预算优化**：主提取 max_tokens 16000→8000，testpoints_table 16000→4000；所有平台 batch_size 统一为3
+- **YAPI出参结构化摘要**：`_summarize_res_schema` 将 response_schema（dict/str）转为字段名+类型+必填+描述(50字)的结构化摘要，替代800字符硬截断；整体YAPI截断6000→8000，单接口200-300字符可覆盖20+接口
 - **下游数据传递**：测试点JSON（含scope/module/platform等字段+TestBatch批次）落盘，下游 TestGenerator 按 platform 路由对应 prompt 分批生成用例
 - **测试用例 prompt 3类合并**：client_test.md（App/Web/H5/通用/E2E共性+framework参数化）+ admin_test.md + backend_test.md，各端框架选型/断言重点通过参数注入，TestGenerator 按 `batch.platform` 自动匹配
 - **自然语言交互**：支持中文/英文自然语言指令，智能解析用户意图
@@ -20,8 +26,8 @@
 - **Web 体验优化**：实时日志面板（增量轮询展示）、分析期间按钮置灰防重复提交、需求分析历史记录（持久化原始文档链接+生成飞书文档链接+任务ID，分页加载：默认3条+每次加载更多5条，可点击回溯）
 - **YAPI 接口数据集成**：需求分析阶段从主文档+关联文档中提取 YAPI 链接（清洗前提取，不丢失），绑定 task_id 存入 history.json；测试点生成时通过内部接口 `getInterfaceData` 拉取接口详情（路径/方法/入参/出参），标准化映射后注入 prompt，AI 为每个接口打标签（本次新增/修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review
 - **飞书日志上下文标注**：日志区分"主文档"与"关联文档"拉取，关联文档失败自动降级为WARNING并跳过（不影响主文档分析）
-- **测试用例飞书按端分类**：生成的测试用例自动上传到对应端飞书文件夹（客户端/后台/后端各一个），文档标题含端标识+批次序号+时间戳
 - **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性；YAPI 接口拉取失败（404/鉴权/超时）自动跳过不阻塞，无接口数据时 AI 仅基于 PRD 正常工作
+- **Flask稳定性**：`debug=False` + `use_reloader=False`，防止 reloader 重启丢失后台线程；所有 `_agent_lock` 用 `with` 上下文管理器确保异常时释放
 
 ---
 
@@ -42,12 +48,11 @@ PythonProject_testagent/
 │   │   ├── agent.py              # 双链路：prd直提（扁平JSON+scope）+ code场景
 │   │   ├── prd_to_testpoints.md  # prd直提提示词（主辅材料+门控指令+scope字段）
 │   │   └── constraints_extract.md# 约束清单提取提示词（防遗漏索引）
-│   ├── test_generator/           # 测试代码生成Agent（ReAct）
+│   ├── test_generator/           # 测试用例JSON生成Agent（截断自适应拆批）
 │   │   ├── agent.py              # 场景→可执行测试代码（按platform路由prompt）
-│   │   ├── generate_test.md      # 通用测试生成提示词
-│   │   ├── client_test.md       # 客户端测试提示词（App/Web/H5/通用/E2E，framework参数化）
-│   │   ├── admin_test.md        # 管理后台测试提示词
-│   │   └── backend_test.md     # 后端服务测试提示词
+│   │   ├── client_test.md       # 客户端测试用例JSON提示词（App/Web/H5/通用/E2E，framework参数化）
+│   │   ├── admin_test.md        # 管理后台测试用例JSON提示词
+│   │   └── backend_test.md     # 后端服务测试用例JSON提示词
 │   └── orchestrator/             # Agent编排器
 │       └── agent.py              # 3步流水线协调
 │
@@ -81,7 +86,7 @@ PythonProject_testagent/
 │
 ├── main.py                        # CLI入口（完整流水线 + 单独Agent调用）
 ├── run_requirement.py            # 独立脚本：飞书文档链接 → 需求分析（一步到位）
-├── web_server.py                 # Flask Web服务（/api/requirement·/test_points·/generate·/pipeline·/feishu·/status·/logs·/history）
+├── web_server.py                 # Flask Web服务（/api/requirement·/test_points·/generate·/generate_async·/generate_status·/pipeline·/feishu·/status·/logs·/history）
 ├── requirements.txt              # Python依赖
 └── .env                          # 环境变量配置
 ```
@@ -174,7 +179,7 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
 **统一产出（两条链路同格式）**：
 - **测试点JSON**：`{id, endpoint, platform, scope, module, detail, priority, source, type}`，落盘 `generated_testpoints/{标题}_{时间戳}.json`
 - **接口索引**：`{title, api_path, method, tag, reason}`，4类标签供测试人员 review，飞书文档末尾追加5列原生表格
-- **TestBatch 结构**：`{platform, platform_label, batch_index, priority, shared_context:{framework,assertion_focus}, test_points[], depends_on[]}`，同端内按可配置 `max_per_batch` 切批（app/web/h5/common=8、backend=12、admin=10、e2e=6），priority 取批内最高
+- **TestBatch 结构**：`{platform, platform_label, batch_index, priority, shared_context:{framework,assertion_focus}, test_points[], depends_on[]}`，同端内按可配置 `max_per_batch` 切批（所有平台统一 batch_size=3），priority 取批内最高
 - **飞书文档**：正文顶部含2行溯源链接（需求文档+需求分析，飞书原生超链接），概述段（总数/P0数/各端分布），按端 H2 分节 + 原生表格（每端序号从1开始），末尾接口索引表（5列：名称/路径/方法/标签/理由）；本地.md同步保存
 - 降级：prd直提失败时降级规则生成 + 确定性表格渲染，产出不断
 
@@ -184,37 +189,45 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
 
 ### 4. TestGeneratorAgent（测试生成Agent）
 
-**职责**：根据测试点批次生成可执行的测试代码，按 platform 路由 3 类 prompt，生成后按端上传到对应飞书文件夹
+**职责**：根据测试点批次生成 JSON 测试用例，按 platform 路由 3 类 prompt，LLM 截断时自动递归拆子批，生成后按端大类整合为飞书文档（每类1个）
 
 **工作流程**：
 ```
-输入：test_point_batch（含 platform + test_points + shared_context）
+输入：test_point_batch（含 platform + test_points + shared_context + requirement_context）
+  ↓
+安全断言：_MAX_POINTS_PER_BATCH=5，超过自动拆批
   ↓
 按 batch.platform 查 _PROMPT_REGISTRY 路由对应 prompt 文件
   ↓ client_test.md（App/Web/H5/通用/E2E）
   ↓ admin_test.md（管理后台）
   ↓ backend_test.md（后端服务）
-注入参数：platform_label / framework / assertion_focus / batch_index / test_points_list
+注入参数：platform_label / framework / assertion_focus / batch_index / test_points_list / requirement_context
   ↓
-LLM生成 Python 测试代码（强制 ```python``` 标记 + 语法校验）
+LLM 生成 JSON 测试用例（9字段：test_module/test_point/test_scenario/test_data/test_steps/expected_results/priority/status/remarks）
   ↓
-保存到 generated_tests/（本地 .py 文件）
+截断检测 _is_truncated → 递归拆子批（binary split，最小粒度2点，最大深度4层）
   ↓
-按 platform 查 _PLATFORM_FOLDER_MAP 路由飞书文件夹 → create_doc 上传
+按端大类分组（客户端/App/Web/H5/通用/E2E→客户端组，backend→后端组，admin→后台组）
   ↓
-输出：test_case + file_path + feishu_url
+cases_to_feishu_struct：按 test_module 分组 → H1模块 + H2测试点 + 6列表格（优先级/测试场景/测试步骤/预期结果/执行结果/备注）
+  ↓
+按 _PLATFORM_FOLDER_MAP 路由飞书文件夹 → create_doc_from_struct 上传
+  ↓
+文档标题：【{需求标题}】{group}测试用例；顶部3行溯源链接（需求文档/需求分析/测试点分析）
+  ↓
+输出：{feishu_docs: [{group, platform, feishu_url, case_count}], total_cases, batch_results}
 ```
 
-**飞书测试用例文件夹路由**：
+**飞书测试用例文件夹路由**（每端大类1个文档）：
 | platform | 飞书文件夹 | 环境变量 |
 |---|---|---|
 | app / web / h5 / common / e2e | 客户端测试用例文件夹 | `FEISHU_TEST_FOLDER_CLIENT` |
 | backend | 后端测试用例文件夹 | `FEISHU_TEST_FOLDER_BACKEND` |
 | admin | 后台测试用例文件夹 | `FEISHU_TEST_FOLDER_ADMIN` |
 
-飞书上传失败不阻塞测试生成（返回空串，本地文件已保存）。
+飞书上传失败不阻塞测试生成（返回空串，已提取的用例仍返回）。
 
-**3 类 prompt 路由表**：
+**3 类 prompt 路由表**（batch_size 统一为 3）：
 | platform | prompt 文件 | framework | 断言重点 |
 |---|---|---|---|
 | app | client_test.md | Appium | 页面元素/交互流程/视觉状态 |
@@ -224,6 +237,19 @@ LLM生成 Python 测试代码（强制 ```python``` 标记 + 语法校验）
 | e2e | client_test.md | Playwright+requests | 跨端流程/数据流转/状态同步 |
 | backend | backend_test.md | requests+pytest | 接口返回码/数据字段/数据库状态 |
 | admin | admin_test.md | Playwright | 页面功能/权限控制/表单校验 |
+
+**异步生成 + 前端轮询**：
+```
+POST /api/generate_async {task_id: "REQ-20260904-xxx"}
+  → 立即返回 {gen_task_id: "GEN-REQ-xxx-171846", status: "queued"}
+  → 后台线程执行全部批次生成 + 飞书文档创建
+  → _generation_tasks 内存 dict 存储状态
+
+GET /api/generate_status?gen_task_id=GEN-REQ-xxx-171846
+  → 返回 {status, progress, total, logs, result?, error?}
+  → status: queued/running/completed/failed
+  → 前端每5秒轮询，展示 x/y批 + 最近日志
+```
 
 **自然语言解析能力**：
 ```
@@ -455,7 +481,32 @@ Content-Type: application/json
 }
 ```
 
-**4. 单独测试生成**
+**4. 测试生成（异步，推荐）**
+```http
+POST /api/generate_async
+Content-Type: application/json
+
+{
+  "task_id": "REQ-20260904-101235"
+}
+# → 立即返回 {gen_task_id, status:"queued"}
+# → 后台线程逐批 execute_batch → 按端大类整合为飞书文档
+# → 按 _PLATFORM_FOLDER_MAP 路由飞书文件夹（客户端/后端/后台各1个）
+```
+
+**5. 异步生成状态查询**
+```http
+GET /api/generate_status?gen_task_id=GEN-REQ-20260904-101235-171846
+# 返回：{
+#   gen_task_id, status: queued|running|completed|failed,
+#   progress, total, created_at, started_at, finished_at,
+#   logs: [{ts, text}]（最近20条）,
+#   result?: {total_cases, feishu_docs: [{group, platform, feishu_url, case_count}], batch_results},
+#   error?: string
+# }
+```
+
+**6. 单独测试生成（同步，兼容）**
 ```http
 POST /api/generate
 Content-Type: application/json
@@ -479,19 +530,19 @@ Content-Type: application/json
 }
 ```
 
-**5. 状态查询**
+**7. 状态查询**
 ```http
 GET /api/status
 ```
 
-**6. 实时日志（增量轮询）**
+**8. 实时日志（增量轮询）**
 ```http
 GET /api/logs?since=0
 # 返回：{ logs: [{seq, text}], latest }
 # 前端底部日志面板按 seq 增量拉取，since 传上次 latest，避免全量重传
 ```
 
-**7. 需求分析历史记录**
+**9. 需求分析历史记录**
 ```http
 GET /api/history?limit=3&offset=0
 # 返回：{ items: [{ created_at, source_doc_url, source_title, feishu_url, local_path, task_id }], total }
@@ -500,7 +551,7 @@ GET /api/history?limit=3&offset=0
 # 每次需求分析成功后自动追加到 generated_requirements/history.json（最新在前，最多100条）
 ```
 
-**8. 飞书文档链接解析**
+**10. 飞书文档链接解析**
 ```http
 POST /api/feishu/parse
 Content-Type: application/json
@@ -514,7 +565,7 @@ Content-Type: application/json
 # 后端自动清理 ASCII 0-31 控制字符（保留 \n\r\t），避免前端 JSON.parse 失败
 ```
 
-**9. 飞书机器人事件回调**
+**11. 飞书机器人事件回调**
 ```http
 POST /api/feishu/event
 Content-Type: application/json
@@ -739,6 +790,7 @@ LLM调用成功 → 智能生成高质量代码
 - **链接提取**：文档清洗前从主文档+关联文档中提取 YAPI URL（正则匹配 `yapi.*\/project\/\d+\/interface\/api(\/\d+)?`），去重存入 metadata.yapi_urls
 - **接口详情拉取**：通过内部接口 `https://ugcqams.snowballfinance.com/internal/getInterfaceData?interfaceYapiId=xxx` 获取接口完整定义
 - **标准化映射层**：`_normalize_yapi_interface()` 将 YAPI 原始响应转为统一结构 `{api_path, method, title, params, response_schema, desc, change_type, related_requirement}`，后两个字段留空待 AI 分析
+- **出参结构化摘要**：`_summarize_res_schema()` 将 response_schema（dict/str）转为字段名+类型+必填+描述(50字)摘要，替代800字符硬截断；整体YAPI截断6000→8000，单接口200-300字符可覆盖20+接口
 - **AI 接口打标**：4 类标签（本次新增/本次修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review
 - **异常降级**：404(已删除)/401,403(鉴权)/Timeout 分别记录 WARNING，部分失败跳过不阻塞，无接口数据时 AI 仅基于 PRD 正常工作
 
