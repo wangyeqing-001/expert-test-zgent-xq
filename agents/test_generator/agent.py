@@ -42,6 +42,48 @@ _PLATFORM_GROUP_LABEL = {
 }
 
 
+class _CircuitBreaker:
+    """P0-1 熔断器：防止 LLM 服务异常时后台线程被占满
+
+    三态：
+      closed  → 正常调用（连续失败 N 次后切 open）
+      open    → 拒绝调用（reset_timeout 后切 half_open 试一次）
+      half_open → 允许一次调用（成功切 closed，失败切 open）
+    """
+
+    def __init__(self, failure_threshold=3, reset_timeout=60):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+        self.state = 'closed'  # closed / open / half_open
+
+    def can_execute(self) -> bool:
+        if self.state == 'open':
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = 'half_open'
+                logger.warning(f"[熔断器] open→half_open，允许一次试探性调用")
+                return True
+            return False  # open 状态，直接拒绝
+        return True  # closed 或 half_open 都允许
+
+    def record_success(self):
+        if self.state in ('open', 'half_open'):
+            logger.warning(f"[熔断器] {self.state}→closed（调用成功）")
+        self.failure_count = 0
+        self.state = 'closed'
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.state == 'half_open':
+            self.state = 'open'
+            logger.warning(f"[熔断器] half_open→open（试探失败，冷却 {self.reset_timeout}s）")
+        elif self.failure_count >= self.failure_threshold:
+            self.state = 'open'
+            logger.warning(f"[熔断器] closed→open（连续失败 {self.failure_count} 次，冷却 {self.reset_timeout}s）")
+
+
 class TestGeneratorAgent(BaseAgent):
     """测试生成Agent：根据需求文档生成测试代码"""
     
@@ -51,10 +93,13 @@ class TestGeneratorAgent(BaseAgent):
         self.output_dir = "generated_tests"
         self.test_type = test_type
         os.makedirs(self.output_dir, exist_ok=True)
-        
+
         # 注册工具
         self.tools = create_default_tools()
         self._register_custom_tools()
+
+        # P0-1 熔断器：连续失败 N 次后走模板降级，防止 LLM 异常雪崩
+        self._cb = _CircuitBreaker(failure_threshold=3, reset_timeout=60)
 
     def execute(self, input_data: dict) -> dict:
         """
@@ -357,14 +402,16 @@ class TestGeneratorAgent(BaseAgent):
             past_batches_summary=sc.get('past_batches_summary', '（首轮批次，无前序参考）'))
         test_cases = []
         platform_label = batch.get('platform_label', platform)
-        if self.llm:
+        if self.llm and self._cb.can_execute():
             try:
                 logger.info(f"  ▶ [LLM调用] 测试用例-{platform_label} batch#{batch.get('batch_index', 1)}（{len(pts)}测试点, max_tokens=3500, depth={_depth}）")
                 t0 = time.time()
-                response = self.llm.generate(prompt, max_tokens=3500)
+                response = self.llm.generate(prompt, max_tokens=3500, timeout=min(30 + len(pts) * 30, 180))
                 logger.info(f"  ◀ [LLM返回] {platform_label} batch#{batch.get('batch_index', 1)} 耗时{time.time()-t0:.1f}s，输出{len(response or '')}字符")
+                self._cb.record_success()  # ✅ 成功，重置计数
             except Exception as e:
                 logger.warning(f"  ✗ LLM 请求异常: {e}")
+                self._cb.record_failure()  # ❌ 失败，计数+1
                 response = ''
             test_cases = self._parse_json_response(response)
             # 截断 → 递归拆子批（最小粒度 2，再小就不拆了）
@@ -387,6 +434,13 @@ class TestGeneratorAgent(BaseAgent):
                     f"[截断但已到最小粒度] {platform}-batch{batch.get('batch_index', 1)}: 0条可提取"
                 )
         else:
+            # self.llm=None 或 熔断器 open → 降级
+            if self.llm and not self._cb.can_execute():
+                logger.warning(
+                    f"  ⚡ [熔断器open] 跳过 {platform_label} batch#{batch.get('batch_index', 1)}，"
+                    f"连续失败 {self._cb.failure_count} 次，冷却还剩 "
+                    f"{max(0, self._cb.reset_timeout - (time.time() - self._cb.last_failure_time)):.0f}s"
+                )
             response = '{"test_cases": []}'
             test_cases = self._parse_json_response(response)
         print(f"  ✓ [{platform} · 第{batch.get('batch_index', 1)}批] 生成 {len(test_cases)} 条用例")
@@ -438,7 +492,7 @@ class TestGeneratorAgent(BaseAgent):
         last_result = []
         for attempt in range(max_retries + 1):
             try:
-                response = self.llm.generate(prompt, max_tokens=max_tokens)
+                response = self.llm.generate(prompt, max_tokens=max_tokens, timeout=min(30 + len(pts) * 30, 180))
             except Exception as e:
                 logger.warning(f"[重试{attempt+1}/{max_retries}] LLM 请求异常: {e}")
                 if attempt < max_retries:

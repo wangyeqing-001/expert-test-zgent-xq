@@ -36,13 +36,17 @@ class LLMClient:
                            "• OpenAI: export OPENAI_API_KEY=sk-xxx\n"
                            "• DeepSeek: export DEEPSEEK_API_KEY=sk-xxx")
 
-    def generate(self, prompt, temperature=0.7, max_tokens=2000):
-        """调用LLM生成测试用例"""
+    def generate(self, prompt, temperature=0.7, max_tokens=2000, timeout=None):
+        """调用LLM生成测试用例
+
+        :param timeout: HTTP 超时（秒），默认 120。大 batch 可传入更大值。
+        """
         try:
             from openai import OpenAI
             import httpx
             # 直连API，绕过系统代理（避免抓包代理导致SSL验证失败）
-            http_client = httpx.Client(trust_env=False, timeout=120)
+            _to = timeout or 120  # P0-2 动态超时
+            http_client = httpx.Client(trust_env=False, timeout=_to)
             client = OpenAI(api_key=self.api_key, base_url=self.base_url, http_client=http_client)
 
             response = client.chat.completions.create(
@@ -59,9 +63,8 @@ class LLMClient:
             finish_reason = response.choices[0].finish_reason
             if finish_reason == 'length':
                 print(f"  [LLM] ⚠ 输出被max_tokens={max_tokens}截断(finish_reason=length)，内容可能不完整")
-            # 日志：打印大模型返回的完整内容
-            print(f"  [LLM] 模型返回内容 (model={self.model}, {len(content)}字符):")
-            print(content)
+            # 日志：打印大模型返回的完整内容（P1-4 trace_id 统一前缀由上层 inject，这里只打原始输出）
+            print(f"  [LLM→{self.model}] 返回 {len(content)} 字符 (finish={finish_reason})")
             return content
 
         except ImportError:

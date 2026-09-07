@@ -6,6 +6,8 @@ import json
 import logging
 import threading
 import requests
+import functools
+import time
 from datetime import datetime
 from collections import deque
 from flask import Flask, request, jsonify, send_from_directory
@@ -253,8 +255,23 @@ def _build_past_batches_summary(past_results: list) -> str:
 YAPI_INTERFACE_API = 'https://ugcqams.snowballfinance.com/internal/getInterfaceData'
 _YAPI_ID_RE = re.compile(r'/interface/api/(\d+)')
 
+# P1-5 YAPI 接口数据内存缓存（TTL=24h，接口定义不会频繁变更）
+_YAPI_CACHE: dict[str, tuple[float, dict]] = {}
+_YAPI_CACHE_LOCK = threading.Lock()
+_YAPI_CACHE_TTL = 24 * 3600  # 24 小时
+
 def _fetch_yapi_interface(yapi_url: str) -> dict:
-    """通过 YAPI URL 拉取接口详情，失败返回空 dict（含失败原因日志）"""
+    """通过 YAPI URL 拉取接口详情，失败返回空 dict（含失败原因日志）
+
+    P1-5 TTL 缓存：同一个 URL 24h 内只拉一次，避免重复调用 YAPI 服务
+    """
+    global _YAPI_CACHE
+    # 命中缓存
+    with _YAPI_CACHE_LOCK:
+        cached = _YAPI_CACHE.get(yapi_url)
+        if cached and (time.time() - cached[0]) < _YAPI_CACHE_TTL:
+            logger.info(f"  ✓ [YAPI缓存命中] {yapi_url}")
+            return cached[1]
     m = _YAPI_ID_RE.search(yapi_url)
     if not m:
         logger.info(f"YAPI 链接无具体接口ID，跳过拉取: {yapi_url}")
@@ -265,7 +282,11 @@ def _fetch_yapi_interface(yapi_url: str) -> dict:
         if resp.status_code == 200:
             data = resp.json()
             if data.get('code') == 0 or data.get('success'):
-                return data.get('data') or data
+                result = data.get('data') or data
+                # 写入缓存（只缓存成功结果，失败的不占缓存）
+                with _YAPI_CACHE_LOCK:
+                    _YAPI_CACHE[yapi_url] = (time.time(), result)
+                return result
             logger.warning(f"YAPI 接口返回业务错误 {yapi_url}: code={data.get('code')}, msg={data.get('message', '')}")
             return data
         elif resp.status_code == 404:
