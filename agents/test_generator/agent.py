@@ -352,7 +352,9 @@ class TestGeneratorAgent(BaseAgent):
             assertion_focus=sc.get('assertion_focus', ''),
             batch_index=batch.get('batch_index', 1),
             test_points_list=test_points_list,
-            requirement_context=sc.get('requirement_context', '（无）'))
+            requirement_context=sc.get('requirement_context', '（无）'),
+            yapi_context=sc.get('yapi_context', '（无 YAPI 接口关联信息）'),
+            past_batches_summary=sc.get('past_batches_summary', '（首轮批次，无前序参考）'))
         test_cases = []
         platform_label = batch.get('platform_label', platform)
         if self.llm:
@@ -440,7 +442,7 @@ class TestGeneratorAgent(BaseAgent):
             except Exception as e:
                 logger.warning(f"[重试{attempt+1}/{max_retries}] LLM 请求异常: {e}")
                 if attempt < max_retries:
-                    max_tokens = min(max_tokens * 2, 8000)
+                    max_tokens = min(max_tokens * 2, 12000)
                     continue
                 raise
             cases = self._parse_json_response(response)
@@ -452,7 +454,7 @@ class TestGeneratorAgent(BaseAgent):
                 last_result = cases
             if attempt < max_retries:
                 old_mt = max_tokens
-                max_tokens = min(max_tokens * 2, 8000)
+                max_tokens = min(max_tokens * 2, 12000)
                 logger.warning(
                     f"[重试{attempt+1}/{max_retries}] LLM 输出被截断（提取{len(cases)}条），"
                     f"max_tokens {old_mt}→{max_tokens} 重新生成"

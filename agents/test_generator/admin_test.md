@@ -37,6 +37,12 @@
 ### 需求文档参考
 {requirement_context}
 
+### 关联接口信息
+{yapi_context}
+
+### 前序批次摘要（避免重复生成）
+{past_batches_summary}
+
 ### 测试点列表
 {test_points_list}
 

@@ -1,10 +1,12 @@
 """测试点生成Agent - 将需求转化为测试场景和测试点"""
 from __future__ import annotations
+import hashlib
 import json
 import os
 import re
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -296,7 +298,7 @@ class TestPointGenerator(BaseAgent):
         """分支A：从原始PRD提取约束清单（防遗漏索引），失败返回''"""
         try:
             prompt = build_prompt(_DIR, 'constraints_extract.md',
-                prd_requirements=prd_text[:12000])
+                prd_requirements=prd_text[:30000])
             logger.info("  ▶ [LLM调用] 测试点-约束清单提取 (max_tokens=4000)")
             t0 = time.time()
             response = self.llm.generate(prompt, max_tokens=4000)
@@ -319,11 +321,40 @@ class TestPointGenerator(BaseAgent):
         if not (self.llm and prd_text):
             return [], []
         try:
-            if structured_constraints is None:
-                structured_constraints = self._extract_constraints(prd_text)
-            # 格式化 YAPI 接口详情供 prompt 注入（标准化结构）
-            yapi_text = '（无接口数据）'
-            if yapi_interfaces:
+            # === P0-3 优化：约束提取（LLM IO） + YAPI 格式化（CPU） 并行 ===
+            cache_key = hashlib.md5((prd_text[:10000] or '').encode()).hexdigest()[:12]
+            cache_dir = os.path.join(os.path.dirname(_DIR), 'generated_requirements')
+            cache_path = os.path.join(cache_dir, f'_constraints_cache_{cache_key}.txt')
+
+            def _extract_constraints_with_cache() -> str:
+                """带本地文件缓存的约束清单提取"""
+                if structured_constraints is not None:
+                    return structured_constraints  # 外部已传入
+                # 查缓存
+                if os.path.exists(cache_path):
+                    try:
+                        with open(cache_path, 'r') as f:
+                            cached = f.read()
+                        if cached:
+                            logger.info(f"  ✓ [约束清单] 命中本地缓存 ({len(cached)}字符)")
+                            return cached
+                    except Exception:
+                        pass
+                # 未命中，调 LLM
+                result = self._extract_constraints(prd_text)
+                # 写缓存（后台失败不阻塞主流程）
+                try:
+                    os.makedirs(cache_dir, exist_ok=True)
+                    with open(cache_path, 'w') as f:
+                        f.write(result)
+                except Exception:
+                    pass
+                return result
+
+            def _format_yapi() -> str:
+                """纯 CPU 的 YAPI 格式化"""
+                if not yapi_interfaces:
+                    return '（无接口数据）'
                 yapi_lines = []
                 for i, item in enumerate(yapi_interfaces, 1):
                     title = item.get('title', '未知')
@@ -332,8 +363,6 @@ class TestPointGenerator(BaseAgent):
                     params = item.get('params', [])
                     res_schema = item.get('response_schema', '')
                     desc = item.get('desc', '')
-
-                    # 入参摘要
                     param_parts = []
                     for p in params:
                         req_tag = '必填' if p.get('required') else '可选'
@@ -341,10 +370,7 @@ class TestPointGenerator(BaseAgent):
                             f"  - {p.get('name', '?')} ({p.get('type', 'string')}, {req_tag}): {p.get('desc', '')}"
                         )
                     param_text = '\n'.join(param_parts) if param_parts else '  （无入参定义）'
-
-                    # 出参：结构化摘要——只保留字段名+类型+必填，不原样截断 JSON Schema
                     res_text = self._summarize_res_schema(res_schema)
-
                     yapi_lines.append(
                         f"### 接口{i}: {title}\n"
                         f"- 路径: {method} {path}\n"
@@ -354,15 +380,23 @@ class TestPointGenerator(BaseAgent):
                         f"- 变更类型: 待分析\n"
                         f"- 关联需求: 待分析"
                     )
-                yapi_text = '\n\n'.join(yapi_lines)
-                # 注：部分接口拉取失败时，仅展示成功项，失败的已在后端日志记录
+                return '\n\n'.join(yapi_lines)
+
+            # 并行执行：约束提取（可能是 LLM，也可能命中缓存） + YAPI 格式化（纯 CPU）
+            t_prep = time.time()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_constraints = pool.submit(_extract_constraints_with_cache)
+                f_yapi = pool.submit(_format_yapi)
+                structured_constraints = f_constraints.result()
+                yapi_text = f_yapi.result()
+            logger.info(f"  ▶ [并行准备] 约束清单 + YAPI 格式化 并行完成，耗时 {time.time()-t_prep:.1f}s")
             prompt = build_prompt(_DIR, 'prd_to_testpoints.md',
-                prd_requirements=prd_text[:12000],
-                structured_constraints=(structured_constraints or '（无辅助材料）')[:4000],
-                yapi_interfaces=yapi_text[:8000])
-            logger.info(f"  ▶ [LLM调用] 测试点-主提取 (prompt约{len(prompt)}字符, max_tokens=8000)")
+                prd_requirements=prd_text[:30000],
+                structured_constraints=(structured_constraints or '（无辅助材料）')[-6000:],
+                yapi_interfaces=yapi_text[:12000])
+            logger.info(f"  ▶ [LLM调用] 测试点-主提取 (prompt约{len(prompt)}字符, max_tokens=12000)")
             t0 = time.time()
-            response = self.llm.generate(prompt, max_tokens=8000)
+            response = self.llm.generate(prompt, max_tokens=12000)
             logger.info(f"  ◀ [LLM返回] 测试点-主提取 耗时{time.time()-t0:.1f}s，输出{len(response or '')}字符")
 
             parsed, interface_index = self._parse_llm_json(response)
@@ -383,10 +417,52 @@ class TestPointGenerator(BaseAgent):
                 print(f"✓ [TestPointGenerator] prd直提 {len(points)} 个测试点")
             if interface_index:
                 print(f"✓ [TestPointGenerator] 接口索引 {len(interface_index)} 条")
+
+            # 后验检查：backend/admin 测试点为 0 但有 YAPI → 警告
+            backend_scopes = {'backend', 'admin'}
+            backend_points = [p for p in points if p.get('scope') in backend_scopes]
+            if len(backend_points) < 3 and yapi_lines:
+                backend_in_yapi = [l for l in yapi_lines if 'backend' in l.lower() or 'admin' in l.lower()]
+                print(f"⚠ [TestPointGenerator] backend/admin 测试点仅 {len(backend_points)} 个（<3），但有 YAPI 接口 {len(yapi_lines)} 个（其中 {len(backend_in_yapi)} 个疑似后端/管理）。"
+                      f"建议检查 prompt 中的强制约束是否生效，或重新生成。")
+
+            # 后验检查：scope 分布
+            by_scope: dict[str, int] = {}
+            for p in points:
+                by_scope[p] = by_scope.get(p.get('scope', 'unknown'), 0) + 1
+            print(f"  📊 scope 分布: {by_scope}")
+
             return points, interface_index
         except Exception as e:
             print(f"⚠ [TestPointGenerator] prd直提异常: {type(e).__name__}: {str(e)[:100]}")
             return [], []
+
+    @staticmethod
+    def _repair_json_for_llm(s: str) -> str:
+        """精确修复 LLM 输出的伪 JSON——只处理确定的格式错误，不误伤内容里的单引号
+
+        修复范围：
+        1. trailing comma（数组/对象末尾多余的 , ）
+        2. 单引号键 → 双引号（只修 'key': 这种键定义，不修值里的）
+        3. 单引号字符串值 → 双引号（保守：只修简单的 'xxx' 模式，跳过含内部单引号的）
+
+        不做的事：不替换值内部的单引号（如 "it's" 在标准 JSON 里合法）
+        """
+        import re as _re
+        if not s:
+            return s
+        # 1. trailing comma: ,] 或 ,}
+        s = _re.sub(r',\s*([}\]])', r'\1', s)
+        # 2. 单引号键 → 双引号: 'key': 或 'key' :
+        s = _re.sub(r"'([^'\"\\]+)'(\s*:)", r'"\1"\2', s)
+        # 3. 单引号字符串值 → 双引号（保守版：跳过含内部单引号的复杂情况）
+        #    匹配模式: : 'xxx' 或 , 'xxx' 或 [ 'xxx' —— 值简单无内部单引号/双引号
+        s = _re.sub(
+            r"(:|,|\[)\s*'([^'\"\\\n]{1,200})'(?=\s*[,}\]])",
+            lambda m: f"{m.group(1)} \"{m.group(2)}\"",
+            s
+        )
+        return s
 
     def _parse_llm_json(self, text: str):
         """统一解析 LLM 输出 JSON
@@ -412,10 +488,12 @@ class TestPointGenerator(BaseAgent):
             try:
                 data = json.loads(s)
             except json.JSONDecodeError:
-                fixed = re.sub(r',\s*([}\]])', r'\1', s)
+                # 精确修复：trailing comma + 单引号键 + 简单单引号值
+                fixed = self._repair_json_for_llm(s)
                 try:
                     data = json.loads(fixed)
                 except json.JSONDecodeError:
+                    logger.debug(f"  JSON 修复仍失败: {str(fixed)[:80]}...")
                     continue
             # 新格式：对象含 test_points
             if isinstance(data, dict) and 'test_points' in data:

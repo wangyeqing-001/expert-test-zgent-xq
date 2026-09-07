@@ -180,6 +180,75 @@ def _merge_feishu_docs(old_docs: list | None, new_docs: list) -> list:
         merged[g] = d  # 同 group 新覆盖旧
     return list(merged.values())
 
+
+# ---- LLM 上下文注入辅助 ----
+
+def _build_yapi_context(yapi_interfaces: list) -> str:
+    """把标准化后的 YAPI 接口列表格式化为 AI 可读的文本摘要"""
+    if not yapi_interfaces:
+        return "（无 YAPI 接口关联信息——本次可能是纯前端改动，或 YAPI 链接未配置）"
+    lines = []
+    lines.append(f"本需求关联 {len(yapi_interfaces)} 个后端接口：")
+    lines.append("")
+    for idx, api in enumerate(yapi_interfaces, 1):
+        method = api.get('method', '?').upper()
+        path = api.get('api_path', '')
+        title = api.get('title', '')
+        desc = api.get('desc', '')
+        params = api.get('params', [])
+        resp_schema = api.get('response_schema', '')
+        lines.append(f"### 接口 {idx}: {title or path}")
+        lines.append(f"- **方法路径**: `{method} {path}`")
+        if desc:
+            lines.append(f"- **描述**: {desc}")
+        if params:
+            param_lines = []
+            for p in params:
+                name = p.get('name', '')
+                ptype = p.get('type', 'string')
+                required = p.get('required', False)
+                rule = p.get('rule', '') or ''
+                suffix = f" {'(必填)' if required else ''}"
+                if rule:
+                    suffix += f" 校验: {rule}"
+                param_lines.append(f"    - `{name}`: {ptype}{suffix}")
+            lines.append(f"- **入参** ({len(params)} 个):\n" + '\n'.join(param_lines))
+        if resp_schema:
+            resp_str = resp_schema if isinstance(resp_schema, str) else json.dumps(resp_schema, ensure_ascii=False)
+            # 截断避免过长
+            if len(resp_str) > 800:
+                resp_str = resp_str[:800] + '...（截断）'
+            lines.append(f"- **出参 schema**: `{resp_str}`")
+        lines.append("")
+    result = '\n'.join(lines)
+    # 整体截断
+    if len(result) > 6000:
+        result = result[:6000] + '\n...（YAPI 信息过长已截断）'
+    return result
+
+
+def _build_past_batches_summary(past_results: list) -> str:
+    """把前序 batch 的执行结果摘要成文本，供后续 batch 避免重复"""
+    if not past_results:
+        return "（首轮批次，无前序参考）"
+    lines = [f"前序 {len(past_results)} 批已生成的用例摘要：", ""]
+    for idx, r in enumerate(past_results, 1):
+        platform_label = r.get('platform_label', '')
+        batch_idx = r.get('batch_index', '')
+        test_cases = r.get('test_cases', [])
+        lines.append(f"--- 第{idx}批 ({platform_label} batch#{batch_idx}) ---")
+        lines.append(f"共 {len(test_cases)} 条用例，覆盖以下功能模块：")
+        # 按 test_module 分组列出
+        by_module: dict[str, list] = {}
+        for tc in test_cases:
+            mod = tc.get('test_module', '')
+            tp = tc.get('test_point', '')
+            by_module.setdefault(mod, []).append(tp)
+        for mod, tps in by_module.items():
+            lines.append(f"  - 【{mod}】: {', '.join(tps[:3])}{' ...' if len(tps) > 3 else ''}")
+        lines.append("")
+    return '\n'.join(lines)
+
 # ---- YAPI 接口详情拉取 ----
 YAPI_INTERFACE_API = 'https://ugcqams.snowballfinance.com/internal/getInterfaceData'
 _YAPI_ID_RE = re.compile(r'/interface/api/(\d+)')
@@ -606,17 +675,33 @@ def _run_generate_in_background(task_id: str, payload: dict):
         batches = tp_data.get('batches', [])
         _progress_log(f"✓ 测试点JSON加载成功，共 {tp_data.get('total', 0)} 个测试点，{len(batches)} 批次")
 
-        # 加载需求文档
+        # 加载需求文档（放宽到 30000 字符）
         requirement_context = '（无）'
         if req_md_path and os.path.exists(req_md_path):
             try:
                 with open(req_md_path, 'r', encoding='utf-8') as f:
-                    requirement_context = f.read()[:8000]
-                _progress_log(f"✓ 需求文档加载成功，{len(requirement_context)} 字符（截取前8000）")
+                    requirement_context = f.read()[:30000]
+                _progress_log(f"✓ 需求文档加载成功，{len(requirement_context)} 字符（放宽到30000）")
             except Exception as e:
                 _progress_log(f"⚠ 需求文档加载失败: {e}")
         else:
             _progress_log("⚠ 未找到需求文档，测试用例将仅基于测试点生成")
+
+        # 加载 YAPI 接口信息
+        yapi_context = '（无 YAPI 接口关联信息）'
+        try:
+            matched_item = None
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                for it in json.load(f):
+                    if it.get('task_id') == task_id_in:
+                        matched_item = it; break
+            if matched_item:
+                yapi_interfaces = _fetch_yapi_interfaces(matched_item.get('yapi_urls', []))
+                yapi_context = _build_yapi_context(yapi_interfaces)
+                if yapi_interfaces:
+                    _progress_log(f"✓ YAPI 接口信息 {len(yapi_interfaces)} 个已加载")
+        except Exception as e:
+            _progress_log(f"⚠ YAPI 加载失败: {e}")
 
         # 大批次拆小
         _SPLIT_THRESHOLD = {}
@@ -675,6 +760,8 @@ def _run_generate_in_background(task_id: str, payload: dict):
             try:
                 sc = batch.get('shared_context') or {}
                 sc['requirement_context'] = requirement_context
+                sc['yapi_context'] = yapi_context
+                sc['past_batches_summary'] = _build_past_batches_summary(all_results)
                 batch['shared_context'] = sc
                 with _agent_lock:
                     result = gen_agent.execute_batch(batch)
@@ -959,6 +1046,10 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
         with _pipeline_tasks_lock:
             pt['total'] = total_batches
 
+        # 加载 YAPI 上下文（Step 2 已拉取 yapi_interfaces）
+        yapi_context = _build_yapi_context(yapi_interfaces) if yapi_interfaces else "（无 YAPI 接口关联信息）"
+        _plog(f"✓ Step 3 YAPI 上下文已准备，需求文档 {len(req_md_text[:30000])} 字符，{len(yapi_interfaces)} 个接口")
+
         # 逐批生成
         all_results = []
         for i, batch in enumerate(flattened_batches):
@@ -970,7 +1061,9 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
 
             try:
                 sc = batch.get('shared_context') or {}
-                sc['requirement_context'] = req_md_text[:8000]
+                sc['requirement_context'] = req_md_text[:30000]
+                sc['yapi_context'] = yapi_context
+                sc['past_batches_summary'] = _build_past_batches_summary(all_results)
                 batch['shared_context'] = sc
                 with _agent_lock:
                     result = gen_agent.execute_batch(batch)
@@ -1293,15 +1386,27 @@ def generate_test():
             if not batches:
                 return jsonify({'error': '测试点JSON中无batches数据'}), 400
 
-            # 加载需求分析文档全文，注入到每批 shared_context.requirement_context
+            # 加载需求分析文档全文 + YAPI 接口 → 注入到每批 shared_context
             requirement_context = '（无）'
             if req_md_path and os.path.exists(req_md_path):
                 try:
                     with open(req_md_path, 'r', encoding='utf-8') as f:
-                        requirement_context = f.read()[:8000]  # 截断防 prompt 超长
-                    logger.info(f"加载需求分析文档 {len(requirement_context)} 字符作为 requirement_context")
+                        requirement_context = f.read()[:30000]
+                    logger.info(f"加载需求分析文档 {len(requirement_context)} 字符（放宽到30000）")
                 except Exception as e:
                     logger.warning(f"加载需求分析文档失败: {e}")
+
+            # 加载 YAPI 接口上下文
+            yapi_context = '（无 YAPI 接口关联信息）'
+            try:
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    for it in json.load(f):
+                        if it.get('task_id') == task_id:
+                            yapi_interfaces = _fetch_yapi_interfaces(it.get('yapi_urls', []))
+                            yapi_context = _build_yapi_context(yapi_interfaces)
+                            break
+            except Exception as e:
+                logger.warning(f"加载 YAPI 失败: {e}")
 
             logger.info(f"task_id={task_id}, 加载测试点 {tp_data.get('total', 0)}个/{len(batches)}批 → 开始生成 JSON 测试用例")
 
@@ -1333,9 +1438,11 @@ def generate_test():
             with _agent_lock:
                 for batch in flattened_batches:
                     try:
-                        # 注入需求文档上下文
+                        # 注入需求文档 + YAPI + 前序 batch 摘要
                         sc = batch.get('shared_context') or {}
                         sc['requirement_context'] = requirement_context
+                        sc['yapi_context'] = yapi_context
+                        sc['past_batches_summary'] = _build_past_batches_summary(all_results)
                         batch['shared_context'] = sc
                         result = gen_agent.execute_batch(batch)
                         all_results.append(result)
@@ -1687,17 +1794,22 @@ def run_pipeline():
                 else:
                     _pipe_batches.append(batch)
 
-            # 注入需求文档上下文
+            # 注入需求文档 + YAPI + 前序 batch 摘要（此入口无 task_id，YAPI 给默认值）
             raw_prd_text = point_result.get('raw_prd', '')
-            for batch in _pipe_batches:
-                sc = batch.get('shared_context') or {}
-                sc['requirement_context'] = raw_prd_text[:8000] if raw_prd_text else '（无）'
-                batch['shared_context'] = sc
+            yapi_context_pipe = '（无 YAPI 接口关联信息）'
+            pipe_all_results = []
 
             with _agent_lock:
                 for batch in _pipe_batches:
                     try:
+                        sc = batch.get('shared_context') or {}
+                        sc['requirement_context'] = raw_prd_text[:30000] if raw_prd_text else '（无）'
+                        sc['yapi_context'] = yapi_context_pipe
+                        sc['past_batches_summary'] = _build_past_batches_summary(pipe_all_results)
+                        batch['shared_context'] = sc
+
                         gen_result = gen_agent.execute_batch(batch)
+                        pipe_all_results.append(gen_result)
                         platform = gen_result.get('platform', 'common')
                         # 给每条用例打上 platform 标签，便于后续按端分组
                         for tc in gen_result.get('test_cases', []):
