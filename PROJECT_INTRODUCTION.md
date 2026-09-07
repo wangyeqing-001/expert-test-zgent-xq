@@ -15,19 +15,28 @@
 - **按端大类整合飞书文档**：客户端(App/Web/H5/通用/E2E)自动合并为1个文档存入客户端文件夹，backend→后端文件夹，admin→后台文件夹；task最多生成3个飞书文档（视需求覆盖端而定）
 - **异步生成 + 前端轮询**：新增 `/api/generate_async`（提交立即返回gen_task_id，后台线程执行）+ `/api/generate_status`（轮询进度/日志/结果）；前端提交后轮询进度面板（x/y批 + 最近日志），避免Flask worker被长耗时请求占用
 - **LLM截断自适应策略**：`_is_truncated` 检测JSON闭合/代码块闭合/结尾断句；截断后**递归拆子批**（binary split）而非翻倍max_tokens，最小粒度2点，最大深度4层；安全断言 `_MAX_POINTS_PER_BATCH=5` 兜底
-- **Token预算优化**：主提取 max_tokens 16000→8000，testpoints_table 16000→4000；所有平台 batch_size 统一为3
-- **YAPI出参结构化摘要**：`_summarize_res_schema` 将 response_schema（dict/str）转为字段名+类型+必填+描述(50字)的结构化摘要，替代800字符硬截断；整体YAPI截断6000→8000，单接口200-300字符可覆盖20+接口
+- **max_tokens 12000**：测试点主提取 max_tokens 提升至 12000（支持输出 40~50 条测试点 JSON）；测试用例生成 token 翻倍重试上限同步提升到 12000；所有平台 batch_size 统一为3
+- **YAPI 全链路结构化注入**：`_summarize_res_schema` 将 response_schema 转为字段名+类型+必填+描述(50字)摘要，替代800字符硬截断；测试点生成 YAPI 截断提升至 12000，测试用例生成通过 `_build_yapi_context` 生成结构化摘要（方法路径+入参+出参schema）注入所有端 prompt；单接口200-300字符可覆盖30+接口
 - **下游数据传递**：测试点JSON（含scope/module/platform等字段+TestBatch批次）落盘，下游 TestGenerator 按 platform 路由对应 prompt 分批生成用例
 - **测试用例 prompt 3类合并**：client_test.md（App/Web/H5/通用/E2E共性+framework参数化）+ admin_test.md + backend_test.md，各端框架选型/断言重点通过参数注入，TestGenerator 按 `batch.platform` 自动匹配
 - **自然语言交互**：支持中文/英文自然语言指令，智能解析用户意图
 - **多LLM提供商支持**：阿里云百炼(DashScope)、DeepSeek、OpenAI GPT-4，三级优先级自动切换
 - **全端测试覆盖**：客户端 App (Appium)、Web/H5 (Playwright)、后端服务 (requests+pytest)、管理后台 (Playwright)、跨端 E2E (Playwright+requests)
 - **多渠道接入**：CLI交互式 + Web图形界面 + 飞书机器人对话 + 飞书链接独立脚本（均为Agent调用渠道）
-- **Web 体验优化**：三个tab（需求分析/测试点/测试用例）均带历史记录区（懒加载+刷新按钮），每条记录展示四链路：📄来源/✨分析/🎯测试点/🧪用例(按端分组+用例数)；底部实时日志面板（增量轮询展示，print+logger全量覆盖 via `_StdoutBridge` 桥接sys.stdout/stderr），分析期间按钮置灰防重复提交
+- **Web 体验优化**：五个tab（🚀一键全流程 / 需求分析 / 测试点 / 测试生成 / 🔍产物查询）；一键全流程支持选端过滤（app/backend/admin 复选框）；产物查询支持按 task_id 精确搜索 + 删除历史 + 查看全部；底部实时日志面板（增量轮询，print+logger 全量覆盖 via `_StdoutBridge` 桥接 stdout/stderr）
 - **YAPI 接口数据集成**：需求分析阶段从主文档+关联文档中提取 YAPI 链接（清洗前提取，不丢失），绑定 task_id 存入 history.json；测试点生成时通过内部接口 `getInterfaceData` 拉取接口详情（路径/方法/入参/出参），标准化映射后注入 prompt，AI 为每个接口打标签（本次新增/修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review
 - **飞书日志上下文标注**：日志区分"主文档"与"关联文档"拉取，关联文档失败自动降级为WARNING并跳过（不影响主文档分析）
 - **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性；YAPI 接口拉取失败（404/鉴权/超时）自动跳过不阻塞，无接口数据时 AI 仅基于 PRD 正常工作
 - **Flask稳定性**：`debug=False` + `use_reloader=False`，防止 reloader 重启丢失后台线程；所有 `_agent_lock` 用 `with` 上下文管理器确保异常时释放
+- **一键全流程 Pipeline**：新增 `/api/pipeline_async`（飞书URL → 选端 → 自动跑完 需求分析 → 测试点 → 测试用例）+ `/api/pipeline_status` 轮询进度；三阶段串联，任意 Step 失败停止并返回已产生的部分结果
+- **上下文注入升级（三阶段30000字符）**：需求文档截断从 8000/12000 统一放宽到 30000，覆盖长 PRD 后半部分功能；测试用例 prompt 新增 `yapi_context`（结构化接口摘要）+ `past_batches_summary`（前序N批用例按模块分组摘要，AI 主动避重）
+- **约束清单并行化 + 缓存**：约束提取（LLM IO）与 YAPI 格式化（纯 CPU）并行执行（ThreadPoolExecutor max_workers=2），总耗时≈max(T_LLM, T_CPU)；同 PRD 的约束清单通过 MD5 哈希命中本地文件缓存，第二次调用跳过一次 LLM（省 30~60s）
+- **prd_to_testpoints.md 强制输出约束**：硬约束写入 prompt：每个 scope 至少 3 个测试点；backend/admin 必须覆盖参数校验/返回码/权限/异常处理；有 YAPI 接口数据时不得遗漏接口相关测试点
+- **JSON 精确修复**：`_repair_json_for_llm` 静态方法——trailing comma + 裸单引号键 + 简单单引号值，不误伤内容内部合法单引号（如 it's 保留）；_parse_llm_json 首次 json.loads 失败后调用
+- **History 管理**：DELETE `/api/history` 按 task_id 删除（清理本地 md/json + history.json，保留飞书云端文档）；`_merge_feishu_docs` 按 group 键合并新旧 docs，不同端互不覆盖，同端新结果覆盖旧结果
+- **平台过滤**：`_PLATFORM_GROUP_EXPANSION` 映射 app→{app,web,h5,common,e2e}；generate_async 和 pipeline 均支持 selected_platforms 参数，过滤后只生成勾选端
+- **后验检查 + scope 分布日志**：测试点生成后自动打印 scope 分布；backend/admin <3 但有 YAPI 时自动 Warning
+
 
 ---
 
@@ -161,14 +170,21 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
 
 ```
 链路1：prd直提（source='prd'，需求来自PRD/飞书文档）
-  原始PRD全文（主材料，唯一事实来源）
-    ├→ 分支A：constraints_extract.md 提取约束清单（防遗漏索引）
+  原始PRD全文[:30000]（主材料，唯一事实来源）
+    ├→ 并行准备阶段（ThreadPoolExecutor max_workers=2）：
+    │   ├→ 约束清单提取（constraints_extract.md，LLM IO）
+    │   │   └→ MD5 哈希本地文件缓存命中时跳过（同 PRD 第二次调用省 30~60s）
+    │   └→ YAPI 接口格式化（纯 CPU，结构化摘要）
     └→ 主流程：prd_to_testpoints.md
         辅助材料注入门控：不作事实来源/无视推测/冲突以PRD为准
-        YAPI 接口数据注入
-        （标准化结构：api_path/method/params/response_schema）
+        YAPI 接口数据注入（截断提升至 12000，结构化摘要单接口 200-300 字符）
         AI 为每个接口打4类标签（新增/修改/复用-回归/复用-无需测试），不丢弃
-      ↓ 一次LLM直出 JSON 对象 {test_points: [...], interface_index: [...]}
+        **强制输出约束（写在 prompt 里）**：
+        - 每个 scope 至少 3 个测试点
+        - backend/admin 必须覆盖 参数校验/返回码/权限/异常处理
+      ↓ 一次LLM直出 JSON 对象 {test_points: [...], interface_index: [...]}（max_tokens=12000）
+      ↓ `_repair_json_for_llm` 精确修复（trailing comma + 裸单引号键 + 简单单引号值，不误伤内容内部合法单引号）
+      ↓ 后验检查：scope 分布统计 + backend/admin <3 但有 YAPI 时 Warning
       ↓ 代码按 _SCOPE_PLATFORM_MAP 白名单映射 scope→platform + 非法scope跳过
       ↓ _split_into_batches：同端内按 max_per_batch 切批 → List[TestBatch]
       ↓ _publish_points：飞书文档正文（溯源链接 + 概述 + 按端H2分节表格 + 接口索引表），不二次调LLM
@@ -194,7 +210,7 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
 
 **工作流程**：
 ```
-输入：test_point_batch（含 platform + test_points + shared_context + requirement_context）
+输入：test_point_batch（含 platform + test_points + shared_context + requirement_context[:30000] + yapi_context + past_batches_summary）
   ↓
 安全断言：_MAX_POINTS_PER_BATCH=5，超过自动拆批
   ↓
