@@ -36,6 +36,14 @@
 - **History 管理**：DELETE `/api/history` 按 task_id 删除（清理本地 md/json + history.json，保留飞书云端文档）；`_merge_feishu_docs` 按 group 键合并新旧 docs，不同端互不覆盖，同端新结果覆盖旧结果
 - **平台过滤**：`_PLATFORM_GROUP_EXPANSION` 映射 app→{app,web,h5,common,e2e}；generate_async 和 pipeline 均支持 selected_platforms 参数，过滤后只生成勾选端
 - **后验检查 + scope 分布日志**：测试点生成后自动打印 scope 分布；backend/admin <3 但有 YAPI 时自动 Warning
+- **核心逻辑单元测试**（53 通过，pytest）：
+  - `TestCircuitBreaker`（8）：closed→open→half_open 三态 + 冷却超时 + 成功/失败回退
+  - `TestDynamicTimeout`（7）：min(30+pts*30, 180) 边界 0/1/3/5/10/20
+  - `TestJSONRepair`（11）：trailing comma + 裸单引号键 + 嵌套 + **合法单引号不误伤**（设计约束）
+  - `TestYAPICache`（4）：命中 / TTL 过期 / 无效 URL 不缓存 / 6 线程并发安全
+  - `TestTruncationDetection`（5）：正常 JSON / 闭合 code block / 未闭合 / 半截
+  - `TestPromptPlaceholders`（8）：三端模板都有 `yapi_context` + `past_batches_summary` + 强制约束
+  - `test_struct_doc`（10）：7 种节点类型 + 脏 JSON 拦截（旧）
 - **P0-1 熔断器 CircuitBreaker**：`_CircuitBreaker` 三态（closed→open→half_open），连续 3 次 LLM 失败切 open 冷却 60s，execute_batch 入口检查 `.can_execute()`；open 状态跳过 LLM 走空列表降级，防止 LLM 异常时后台线程雪崩
 - **P0-2 动态 HTTP timeout**：`LLMClient.generate(timeout=None)` 参数化；execute_batch 两处 LLM 调用 `min(30 + len(pts)*30, 180)` —— 3 测试点→120s，20→180s 封顶，0→30s 保底；解决大 batch 正常生成也会被 120s 固定 timeout 截断的问题
 - **P1-5 YAPI 接口 TTL 缓存**：`_fetch_yapi_interface` 内存缓存 `_YAPI_CACHE` + `_YAPI_CACHE_LOCK` + TTL=24h；成功拉取后写缓存，下次相同 URL 直接返回（日志 `✓[YAPI缓存命中]`）；只缓存成功结果，失败不占缓存；同 PRD 多次生成测试点时节省 30~60s 重复拉取时间
@@ -94,7 +102,9 @@ PythonProject_testagent/
 ├── generated_tests/               # 测试代码输出
 ├── generated_requirements/        # 需求分析文档输出（含 history.json 历史记录索引）
 ├── generated_testpoints/          # 测试点输出（按端分节表格.md + JSON落盘）
-├── tests/                         # 单元测试（structured_doc等）
+├── tests/                         # 单元测试（pytest）
+│   ├── test_struct_doc.py          # structured_doc 解析 + 脏 JSON 拦截（10 个）
+│   └── test_core_optimizations.py  # 熔断器 + 动态 timeout + JSON 修复 + YAPI 缓存 + 截断检测 + prompt 占位符（43 个）
 ├── demo/                          # 示例被分析代码
 ├── web/                           # Web前端资源
 │   └── index.html                # 前端页面（需求分析/测试点/测试生成 + 实时日志 + 历史记录分页）
@@ -184,7 +194,7 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
     └→ 主流程：prd_to_testpoints.md
         辅助材料注入门控：不作事实来源/无视推测/冲突以PRD为准
         YAPI 接口数据注入（截断提升至 12000，结构化摘要单接口 200-300 字符）
-        AI 为每个接口打4类标签（新增/修改/复用-回归/复用-无需测试），不丢弃
+
         **强制输出约束（写在 prompt 里）**：
         - 每个 scope 至少 3 个测试点
         - backend/admin 必须覆盖 参数校验/返回码/权限/异常处理
