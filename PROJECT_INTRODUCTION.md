@@ -165,7 +165,8 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
     ├→ 分支A：constraints_extract.md 提取约束清单（防遗漏索引）
     └→ 主流程：prd_to_testpoints.md
         辅助材料注入门控：不作事实来源/无视推测/冲突以PRD为准
-        YAPI 接口数据注入（标准化结构：api_path/method/params/response_schema）
+        YAPI 接口数据注入
+        （标准化结构：api_path/method/params/response_schema）
         AI 为每个接口打4类标签（新增/修改/复用-回归/复用-无需测试），不丢弃
       ↓ 一次LLM直出 JSON 对象 {test_points: [...], interface_index: [...]}
       ↓ 代码按 _SCOPE_PLATFORM_MAP 白名单映射 scope→platform + 非法scope跳过

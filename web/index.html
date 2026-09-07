@@ -903,6 +903,7 @@
                 resultDiv.innerHTML = progressHtml;
 
                 if (s.status === 'completed') {
+                    console.log('[pollGenerateStatus] completed, s.result:', JSON.stringify(s.result).substring(0, 500));
                     return {success: true, ...s.result};
                 } else if (s.status === 'failed') {
                     return {success: false, error: s.error || '生成失败'};
@@ -914,6 +915,8 @@
 
         // 显示测试结果
         function displayGenerateResult(data) {
+            console.log('[displayGenerateResult] 收到 data:', JSON.stringify(data).substring(0, 500));
+            console.log('[displayGenerateResult] feishu_docs:', data.feishu_docs);
             const badge = document.getElementById('gen-badge');
             badge.className = 'badge badge-success';
             badge.textContent = '✓ 生成成功';
