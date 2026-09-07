@@ -103,15 +103,20 @@ class TestPointGenerator(BaseAgent):
                 scenarios = self._points_to_scenarios(test_points)  # 下游兼容（旧路径）
             else:
                 print("  [测试点] prd直提失败, 降级规则生成 + 阶段2表格链路")
-                batches = []
                 scenarios = self._generate_by_rules(requirements)
                 local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title, source=source)
+                # fallback 也要分批，保证 Step 3 能读到 batches
+                batches = self._split_into_batches(test_points) if test_points else []
+                if batches and json_path:
+                    self._append_batches_to_json(json_path, test_points, batches)
         else:
-            batches = []
             scenarios = self._generate_from_code_requirements(requirements, test_type)
             # 表格产出：本地.md + 飞书文档（列结构由testpoints_table.md指定）
             # 同时提取测试点JSON落盘，供下游用例生成（分批送入大模型）使用
             local_path, feishu_url, json_path, test_points = self._save_and_publish_table(scenarios, doc_title, source=source)
+            batches = self._split_into_batches(test_points) if test_points else []
+            if batches and json_path:
+                self._append_batches_to_json(json_path, test_points, batches)
 
         self.state = {
             'scenario_count': len(scenarios),
@@ -512,8 +517,19 @@ class TestPointGenerator(BaseAgent):
         print(f"⚠ [TestPointGenerator] JSON 解析失败（扁平 & 老格式均不通）")
         return None, []
 
+    # LLM 可能输出的 scope 别名/自然语言 → 标准 scope 映射
+    _SCOPE_ALIASES = {
+        '客户端': 'client_common', 'client': 'client_common', 'app': 'client_app',
+        '客户端app': 'client_app', '客户端web': 'client_web', '客户端h5': 'client_h5',
+        '通用客户端': 'client_common', '移动端': 'client_app',
+        'web端': 'client_web', 'h5端': 'client_h5', 'h5': 'client_h5',
+        '后台': 'admin', '管理后台': 'admin', 'admin': 'admin', '运营后台': 'admin',
+        '后端': 'backend', '后端服务': 'backend', '服务端': 'backend', 'backend': 'backend',
+        'e2e': 'e2e', '端到端': 'e2e', '跨端': 'e2e',
+    }
+
     def _flatten_items_to_points(self, items: list) -> list:
-        """扁平数组 → 测试点列表（scope 白名单 + 字段校验）"""
+        """扁平数组 → 测试点列表（scope 白名单 + 字段校验 + endpoint 别名兼容）"""
         points = []
         for item in items:
             if not isinstance(item, dict):
@@ -521,11 +537,25 @@ class TestPointGenerator(BaseAgent):
             detail = str(item.get('detail', '')).strip()
             if not detail:
                 continue
+            # 1. 优先取标准 scope 字段
             scope = str(item.get('scope', '')).strip()
             platform = self._SCOPE_PLATFORM_MAP.get(scope)
+            # 2. scope 没命中：尝试 endpoint 字段（LLM 常输出 endpoint 而非 scope）
+            if platform is None and not scope:
+                endpoint_val = str(item.get('endpoint', '')).strip().lower()
+                alias_scope = self._SCOPE_ALIASES.get(endpoint_val)
+                if alias_scope:
+                    scope = alias_scope
+                    platform = self._SCOPE_PLATFORM_MAP.get(scope)
+            # 3. 还没命中：尝试 alias 直接匹配
+            if platform is None:
+                alias_scope = self._SCOPE_ALIASES.get(scope.lower())
+                if alias_scope:
+                    scope = alias_scope
+                    platform = self._SCOPE_PLATFORM_MAP.get(scope)
             if platform is None:
                 # scope 非法：跳过，但记录日志方便排查 prompt 没生效
-                print(f"  [扁平解析] 跳过非法 scope={scope!r}, detail={detail[:40]!r}")
+                print(f"  [扁平解析] 跳过非法 scope={scope!r} detail={detail[:40]!r} (可用值: endpoint={item.get('endpoint','')!r})")
                 continue
             t = str(item.get('type', 'normal')).strip().lower()
             label = self._PLATFORM_CONFIG[platform][0]
@@ -634,6 +664,20 @@ class TestPointGenerator(BaseAgent):
                     'depends_on': [],  # 预留：批次间依赖，首期留空
                 })
         return batches
+
+    @staticmethod
+    def _append_batches_to_json(json_path: str, test_points: list, batches: list):
+        """fallback 路径补 batches 字段到已落盘的 JSON"""
+        try:
+            with open(json_path) as f:
+                data = json.load(f)
+            data['batches'] = batches
+            data['total'] = len(test_points)
+            with open(json_path, 'w') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"  [fallback分批] ✓ 已将 {len(batches)} 批写入 {json_path}")
+        except Exception as e:
+            print(f"  [fallback分批] ✗ 写 batches 到 JSON 失败: {e}")
 
     def _publish_points(self, test_points: list, title: str,
                         source_doc_url: str = '', analysis_doc_url: str = '',

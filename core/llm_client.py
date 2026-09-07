@@ -1,87 +1,166 @@
-"""LLM客户端 - 支持多种模型"""
+"""LLM客户端 - 百炼 DashScope 原生 API 优先 + OpenAI 兼容模式 fallback
+
+调用方式：
+- 纯文本（默认）: dashscope.Generation.call → 原生 API，最快最稳
+- 多模态（图片+文本）: dashscope.MultiModalConversation.call → 原生 API
+- fallback: 无 dashscope 时走 OpenAI SDK + 兼容模式 URL
+
+.env 只需一行：DASHSCOPE_API_KEY=sk-xxx
+"""
 import os
 
 
 class LLMClient:
-    def __init__(self, api_key=None, base_url=None):
-        # 支持多种LLM提供商
+    def __init__(self, api_key=None, base_url=None, model=None):
+        # 百炼原生优先
         self.api_key = api_key or os.getenv('DASHSCOPE_API_KEY') or os.getenv('OPENAI_API_KEY') or os.getenv('DEEPSEEK_API_KEY')
-        
-        # 自动识别API提供商
-        if not base_url:
-            if os.getenv('DASHSCOPE_API_KEY'):
-                # 阿里云百炼默认配置
-                self.base_url = os.getenv('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
-                self.model = os.getenv('DASHSCOPE_MODEL', 'qwen-plus')
-            elif os.getenv('DEEPSEEK_API_KEY') and not os.getenv('OPENAI_API_KEY'):
-                # DeepSeek默认配置
-                self.base_url = os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-                self.model = os.getenv('DEEPSEEK_MODEL', 'deepseek-v4-flash')
-            else:
-                self.base_url = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
-                self.model = os.getenv('LLM_MODEL', 'gpt-4')
-        else:
-            self.base_url = base_url
-            # 根据base_url判断模型
-            if 'dashscope' in base_url or 'aliyun' in base_url:
-                self.model = os.getenv('DASHSCOPE_MODEL', 'qwen-plus')
-            elif 'deepseek' in base_url:
-                self.model = os.getenv('DEEPSEEK_MODEL', 'deepseek-v4-flash')
-            else:
-                self.model = os.getenv('LLM_MODEL', 'gpt-4')
+        self.model = model or os.getenv('DASHSCOPE_MODEL', 'qwen-plus')
+        self.base_url = base_url  # 仅 OpenAI fallback 时用
 
         if not self.api_key:
-            raise ValueError("请设置API Key：\n" 
-                           "• 阿里云百炼: export DASHSCOPE_API_KEY=sk-xxx\n"
-                           "• OpenAI: export OPENAI_API_KEY=sk-xxx\n"
-                           "• DeepSeek: export DEEPSEEK_API_KEY=sk-xxx")
-
-    def generate(self, prompt, temperature=0.7, max_tokens=2000, timeout=None):
-        """调用LLM生成测试用例
-
-        :param timeout: HTTP 超时（秒），默认 120。大 batch 可传入更大值。
-        """
-        try:
-            from openai import OpenAI
-            import httpx
-            # 直连API，绕过系统代理（避免抓包代理导致SSL验证失败）
-            _to = timeout or 120  # P0-2 动态超时
-            http_client = httpx.Client(trust_env=False, timeout=_to)
-            client = OpenAI(api_key=self.api_key, base_url=self.base_url, http_client=http_client)
-
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "你是专业的测试工程师"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens
+            raise ValueError(
+                "请设置 API Key：\n"
+                "  • 阿里云百炼（推荐）: export DASHSCOPE_API_KEY=sk-xxx\n"
+                "  • OpenAI fallback:    export OPENAI_API_KEY=sk-xxx"
             )
-            content = response.choices[0].message.content or ''
-            # 截断告警：输出被max_tokens截断时，JSON等结构化输出必然解析失败
-            finish_reason = response.choices[0].finish_reason
-            if finish_reason == 'length':
-                print(f"  [LLM] ⚠ 输出被max_tokens={max_tokens}截断(finish_reason=length)，内容可能不完整")
-            # 日志：打印大模型返回的完整内容（P1-4 trace_id 统一前缀由上层 inject，这里只打原始输出）
-            print(f"  [LLM→{self.model}] 返回 {len(content)} 字符 (finish={finish_reason})")
-            return content
 
-        except ImportError:
-            return self._mock_generate(prompt)
+        # dashscope SDK 全局设 key
+        os.environ.setdefault('DASHSCOPE_API_KEY', self.api_key)
 
+    # ============================================================
+    # 核心方法：纯文本生成（百炼原生 Generation.call）
+    # ============================================================
+    def generate(self, prompt, temperature=0.7, max_tokens=2000, timeout=None, system_prompt=None):
+        """纯文本 LLM 调用 —— 百炼原生 Generation.call 优先"""
+        try:
+            return self._dashscope_generate(prompt, temperature, max_tokens, timeout, system_prompt)
+        except Exception as e:
+            if 'dashscope' in str(type(e).__module__).lower() or 'ImportError' in str(type(e).__name__):
+                # dashscope 不可用或失败，fallback OpenAI 兼容模式
+                try:
+                    return self._openai_generate(prompt, temperature, max_tokens, timeout, system_prompt)
+                except Exception as e2:
+                    raise RuntimeError(f"LLM 调用失败（dashscope + openai 都挂了）: dashscope={e}, openai={e2}")
+            raise
+
+    # ============================================================
+    # 多模态：文字 + 图片（百炼原生 MultiModalConversation.call）
+    # ============================================================
+    def generate_with_images(self, prompt_text, image_paths=None, temperature=0.7, max_tokens=2000):
+        """多模态生成 —— 文字 + 本地图片
+
+        :param prompt_text: 文字 prompt
+        :param image_paths: 本地图片路径列表
+        """
+        from dashscope import MultiModalConversation
+        import base64, mimetypes
+
+        content = [{'text': prompt_text}]
+        for img_path in (image_paths or []):
+            mime, _ = mimetypes.guess_type(img_path)
+            mime = mime or 'image/png'
+            with open(img_path, 'rb') as f:
+                b64 = base64.b64encode(f.read()).decode()
+            content.append({'image': f'data:{mime};base64,{b64}'})
+
+        messages = [{'role': 'user', 'content': content}]
+
+        resp = MultiModalConversation.call(
+            api_key=self.api_key,
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            result_format='message',
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"MultiModalConversation 失败: status={resp.status_code}, msg={resp.message}")
+
+        raw = resp.output.choices[0].message.content
+        # content 可能是 [{'text': '...'}] 列表（VL 模式）
+        if isinstance(raw, list):
+            parts = []
+            for item in raw:
+                if isinstance(item, dict) and 'text' in item:
+                    parts.append(item['text'])
+            content = '\n'.join(parts) if parts else str(raw)
+        else:
+            content = str(raw)
+
+        print(f"  [LLM-VL→{self.model}] 返回 {len(content)} 字符")
+        return content
+
+    # ============================================================
+    # 内部：百炼原生 Generation.call
+    # ============================================================
+    def _dashscope_generate(self, prompt, temperature, max_tokens, timeout, system_prompt):
+        from dashscope import Generation
+
+        messages = []
+        if system_prompt:
+            messages.append({'role': 'system', 'content': system_prompt})
+        messages.append({'role': 'user', 'content': prompt})
+
+        resp = Generation.call(
+            api_key=self.api_key,
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            result_format='message',
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"dashscope Generation 失败: status={resp.status_code}, msg={resp.message}")
+
+        content = resp.output.choices[0].message.content or ''
+        finish_reason = resp.output.choices[0].get('finish_reason', 'stop')
+
+        if finish_reason == 'length':
+            print(f"  [LLM] ⚠ 输出被 max_tokens={max_tokens} 截断（finish_reason=length）")
+
+        print(f"  [LLM→{self.model}] 返回 {len(content)} 字符 (finish={finish_reason})")
+        return content
+
+    # ============================================================
+    # 内部：OpenAI 兼容模式 fallback
+    # ============================================================
+    def _openai_generate(self, prompt, temperature, max_tokens, timeout, system_prompt):
+        from openai import OpenAI
+        import httpx
+
+        base_url = self.base_url or os.getenv('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+        _to = timeout or 120
+        http_client = httpx.Client(trust_env=False, timeout=_to)
+        client = OpenAI(api_key=self.api_key, base_url=base_url, http_client=http_client)
+
+        messages = []
+        if system_prompt:
+            messages.append({'role': 'system', 'content': system_prompt})
+        messages.append({'role': 'user', 'content': prompt})
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        content = response.choices[0].message.content or ''
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason == 'length':
+            print(f"  [LLM] ⚠ 输出被 max_tokens={max_tokens} 截断（finish_reason=length）")
+        print(f"  [LLM(fallback)→{self.model}] 返回 {len(content)} 字符 (finish={finish_reason})")
+        return content
+
+    # ============================================================
+    # 兼容旧接口的 mock
+    # ============================================================
     def _mock_generate(self, prompt):
-        """无API时的模拟实现 - 客户端测试场景"""
+        """无 API 时的模拟实现"""
         import re
-
         func_match = re.search(r'功能名: (\w+)', prompt)
-        
         if not func_match:
             return ""
-        
         func_name = func_match.group(1)
-        
-        # 根据prompt判断测试类型
         if 'Appium' in prompt or 'mobile' in prompt.lower():
             from utils.template_loader import ClientTestTemplates
             return ClientTestTemplates.appium_mobile_test(func_name)
@@ -92,6 +171,5 @@ class LLMClient:
             from utils.template_loader import ClientTestTemplates
             return ClientTestTemplates.api_client_test(func_name)
         else:
-            # 默认Playwright Web测试
             from utils.template_loader import ClientTestTemplates
             return ClientTestTemplates.playwright_web_test(func_name)
