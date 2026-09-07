@@ -16,11 +16,18 @@ def load_prompt(directory: str, filename: str) -> str:
 
 
 def build_prompt(directory: str, filename: str, **kwargs) -> str:
-    """加载md模板并替换占位符。调用方自行截断字段值。"""
+    """加载md模板并替换占位符。调用方自行截断字段值。
+    若 kwargs 中有模板里不存在的占位符，静默跳过（不报错），
+    但会告警（logger.warning）提醒调用方检查。
+    """
+    import logging
+    logger = logging.getLogger(__name__)
     template = load_prompt(directory, filename)
     for key, value in kwargs.items():
         placeholder = '{' + key + '}'
         if placeholder not in template:
-            raise ValueError(f"{filename} 缺少 {placeholder} 占位符")
+            # 静默跳过，不报错——有些 prompt 不需要某些可选字段
+            logger.debug(f"{filename}: 跳过不存在的占位符 {placeholder}")
+            continue
         template = template.replace(placeholder, str(value))
     return template

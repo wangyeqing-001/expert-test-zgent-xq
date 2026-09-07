@@ -29,7 +29,7 @@
 
 以下是需求文档中涉及的接口清单（已标准化为结构化数据）：
 
-{yapi\_interfaces}
+{yapi_interfaces}
 
 ### 接口数据字段说明
 

@@ -758,22 +758,11 @@ class TestPointGenerator(BaseAgent):
             print("  [测试点表格] 无场景数据, 跳过表格产出")
             return None, None, None, []
         
-        # 1. LLM生成业务JSON（列结构由prompt指定）→ 解析失败降级确定性渲染
-        struct_nodes = None
-        if self.llm:
-            struct_nodes = self._gen_table_struct(scenarios)
-        
-        if struct_nodes:
-            # 先从table节点提取测试点JSON（供下游），再转对齐文本（顺序不可颠倒）
-            test_points = self._extract_test_points(struct_nodes, source=source)
-            md = struct_to_markdown(struct_nodes)
-            mode = 'LLM表格(原生飞书表格)'
-        else:
-            print("  [测试点表格] LLM表格链路失败/未启用, 降级确定性渲染")
-            struct_nodes = self._render_scenarios_struct(scenarios, title)
-            test_points = self._fallback_test_points(scenarios, source=source)
-            md = struct_to_markdown(struct_nodes)
-            mode = '确定性渲染(纯文本对齐)'
+        # 1. 确定性表格渲染（testpoints_table.md 已移除，LLM 生成表格结构非必需）
+        struct_nodes = self._render_scenarios_struct(scenarios, title)
+        test_points = self._fallback_test_points(scenarios, source=source)
+        md = struct_to_markdown(struct_nodes)
+        mode = '确定性渲染(纯文本对齐)'
         
         # 2. 保存本地.md
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -856,22 +845,7 @@ class TestPointGenerator(BaseAgent):
                 'type': s.get('scenario', 'normal') or 'normal'
             })
         return points
-    
-    def _gen_table_struct(self, scenarios: list):
-        """调LLM按testpoints_table.md生成业务JSON节点列表，失败返回None"""
-        try:
-            prompt = build_prompt(_DIR, 'testpoints_table.md',
-                scenarios_json=json.dumps(scenarios, ensure_ascii=False)[:6000])
-            response = self.llm.generate(prompt, max_tokens=4000)
-            nodes = parse_struct_json(response)
-            if nodes:
-                n_table = sum(1 for n in nodes if n['type'] == 'table')
-                print(f"  [测试点表格] LLM表格生成成功: {len(nodes)}个节点, {n_table}个表格")
-            return nodes
-        except Exception as e:
-            print(f"  [测试点表格] LLM表格生成异常: {type(e).__name__}: {str(e)[:100]}")
-            return None
-    
+
     @staticmethod
     def _tables_to_aligned_code(struct_nodes: list) -> list:
         """把struct中的table节点转为纯文本对齐表格(code节点)，

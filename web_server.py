@@ -1,6 +1,7 @@
 """Web服务 - Flask后端API"""
 import os
 import re
+import sys
 import json
 import logging
 import threading
@@ -60,6 +61,26 @@ _buf_handler.setFormatter(logging.Formatter(
 logging.getLogger().addHandler(_buf_handler)
 # 降低 werkzeug 请求日志级别，避免轮询刷屏
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
+
+class _StdoutBridge:
+    """把 print() 输出同时写入 _log_buffer，让前端能看到所有日志。"""
+    def __init__(self, original):
+        self._orig = original
+    def write(self, s):
+        self._orig.write(s)
+        if s and s.strip():
+            with _log_lock:
+                global _log_seq
+                _log_seq += 1
+                _log_buffer.append((_log_seq, s.rstrip('\n')))
+    def flush(self):
+        self._orig.flush()
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+sys.stdout = _StdoutBridge(sys.stdout)
+sys.stderr = _StdoutBridge(sys.stderr)
 
 app = Flask(__name__, static_folder='web', static_url_path='')
 CORS(app)
