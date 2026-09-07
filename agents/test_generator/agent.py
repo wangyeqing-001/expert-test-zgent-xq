@@ -354,6 +354,7 @@ class TestGeneratorAgent(BaseAgent):
             test_points_list=test_points_list,
             requirement_context=sc.get('requirement_context', '（无）'))
         test_cases = []
+        platform_label = batch.get('platform_label', platform)
         if self.llm:
             try:
                 logger.info(f"  ▶ [LLM调用] 测试用例-{platform_label} batch#{batch.get('batch_index', 1)}（{len(pts)}测试点, max_tokens=3500, depth={_depth}）")
