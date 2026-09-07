@@ -340,6 +340,7 @@
         }
         .log-panel.collapsed .log-body { display: none; }
         .log-panel.collapsed .log-actions { display: none; }
+        .log-actions select { font-size: 11px; padding: 1px 4px; border-radius: 3px; border: 1px solid #ddd; margin-right: 4px; }
         .log-line { padding: 1px 0; }
         .log-line.error { color: #dc3545; }
         .log-line.warning { color: #b7791f; }
@@ -517,6 +518,9 @@
         <div class="log-header" onclick="toggleLogPanel()">
             <strong>📡 实时日志</strong>
             <div class="log-actions" onclick="event.stopPropagation()">
+                <select id="log-task-filter" onchange="onLogFilterChange()" title="按任务过滤">
+                    <option value="">全部任务</option>
+                </select>
                 <button onclick="clearLogs()">清空</button>
                 <button id="log-pause-btn" onclick="togglePauseLogs()">暂停</button>
                 <button id="log-autoscroll-btn" onclick="toggleAutoScroll()">自动滚动: 开</button>
@@ -754,6 +758,7 @@
         // 生成测试点
         async function generateTestPoints() {
             if (isProcessing) return;
+            expandLogPanel();
             const query = document.getElementById('tp-query').value.trim();
             const taskId = document.getElementById('tp-task-id').value.trim();
 
@@ -823,6 +828,7 @@
         // 生成测试
         async function generateTest() {
             if (isProcessing) return;
+            expandLogPanel();
             const taskId = document.getElementById('gen-task-id').value.trim();
             const doc = document.getElementById('gen-doc').value.trim();
             const query = document.getElementById('gen-query').value.trim();
@@ -988,6 +994,7 @@
 
         // 导入飞书文档
         async function importFeishuDoc() {
+            expandLogPanel();
             const docUrl = document.getElementById('feishu-url').value.trim();
             if (!docUrl) {
                 alert('请输入飞书文档链接');
@@ -1162,7 +1169,30 @@
             return 'info';
         }
 
+        // 前端 task_id → 显示名 映射（从日志中动态收集）
+        const _taskIdLabels = {};
+
+        function _extractTaskId(text) {
+            const m = text.match(/\[(REQ-\d{8}-\d{6}|GEN-REQ-\d{8}-\d{6}-\d{4,6})\]/);
+            return m ? m[1] : null;
+        }
+
+        function _updateTaskFilter(text) {
+            const tid = _extractTaskId(text);
+            if (!tid) return;
+            const sel = document.getElementById('log-task-filter');
+            if (!sel.querySelector(`option[value="${tid}"]`)) {
+                const opt = document.createElement('option');
+                opt.value = tid;
+                opt.textContent = tid;
+                sel.appendChild(opt);
+            }
+        }
+
         function appendLogLine(text) {
+            _updateTaskFilter(text);
+            const filter = document.getElementById('log-task-filter').value;
+            if (filter && !text.includes(`[${filter}]`)) return;  // 过滤掉不匹配的
             const body = document.getElementById('log-body');
             const line = document.createElement('div');
             line.className = 'log-line ' + logLevelClass(text);
@@ -1172,9 +1202,16 @@
             if (logAutoScroll) body.scrollTop = body.scrollHeight;
         }
 
+        function onLogFilterChange() {
+            // 清空前端显示缓存，重新拉取
+            document.getElementById('log-body').innerHTML = '';
+        }
+
         async function pollLogs() {
             try {
-                const r = await fetch('/api/logs?since=' + logSince);
+                const filter = document.getElementById('log-task-filter').value;
+                const url = '/api/logs?since=' + logSince + (filter ? '&task_id=' + encodeURIComponent(filter) : '');
+                const r = await fetch(url);
                 const d = await r.json();
                 if (d.logs && d.logs.length) {
                     d.logs.forEach(l => appendLogLine(l.text));
@@ -1197,6 +1234,15 @@
                 startLogPolling();
                 const body = document.getElementById('log-body');
                 body.scrollTop = body.scrollHeight;
+            }
+        }
+
+        function expandLogPanel() {
+            const p = document.getElementById('log-panel');
+            if (p.classList.contains('collapsed')) {
+                p.classList.remove('collapsed');
+                p.classList.add('expanded');
+                startLogPolling();
             }
         }
 

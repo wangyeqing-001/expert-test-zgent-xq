@@ -38,14 +38,29 @@ def clean_control_chars(text: str) -> str:
 _log_buffer = deque(maxlen=500)
 _log_seq = 0
 _log_lock = threading.Lock()
+# 每个线程关联的 task_id（用于日志过滤）
+_thread_task_id: dict[int, str] = {}
+
+
+def _set_thread_task_id(task_id: str):
+    """当前线程标记正在处理的 task_id"""
+    _thread_task_id[threading.get_ident()] = task_id
+
+
+def _get_thread_task_id() -> str:
+    """获取当前线程的 task_id（可能为空）"""
+    return _thread_task_id.get(threading.get_ident(), '')
 
 
 class _BufferLogHandler(logging.Handler):
-    """把日志同步写入内存缓冲，前端轮询展示。"""
+    """把日志同步写入内存缓冲，前端轮询展示。自动附带线程 task_id 标签。"""
     def emit(self, record):
         global _log_seq
         try:
             text = self.format(record)
+            tid = _get_thread_task_id()
+            if tid and tid not in text:
+                text = f"[{tid}] {text}"
             with _log_lock:
                 _log_seq += 1
                 _log_buffer.append((_log_seq, text))
@@ -64,7 +79,7 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 
 class _StdoutBridge:
-    """把 print() 输出同时写入 _log_buffer，让前端能看到所有日志。"""
+    """把 print() 输出同时写入 _log_buffer，让前端能看到所有日志。自动附带线程 task_id。"""
     def __init__(self, original):
         self._orig = original
     def write(self, s):
@@ -73,7 +88,11 @@ class _StdoutBridge:
             with _log_lock:
                 global _log_seq
                 _log_seq += 1
-                _log_buffer.append((_log_seq, s.rstrip('\n')))
+                tid = _get_thread_task_id()
+                text = s.rstrip('\n')
+                if tid and tid not in text:
+                    text = f"[{tid}] {text}"
+                _log_buffer.append((_log_seq, text))
     def flush(self):
         self._orig.flush()
     def __getattr__(self, name):
@@ -298,6 +317,8 @@ def analyze_requirement():
         if not query:
             return jsonify({'error': '查询内容不能为空'}), 400
 
+        task_id = f"REQ-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        _set_thread_task_id(task_id)
         logger.info("========== Step 1/3: 需求分析 ==========")
         with _agent_lock:
             result = req_agent.process_query(query, title=doc_title, feishu_url=doc_url)
@@ -350,7 +371,9 @@ def generate_test_points():
         task_id = data.get('task_id', '')
         prd_url = data.get('prd_url', '')
         raw_prd_text = data.get('raw_prd', '')
-        
+
+        if task_id:
+            _set_thread_task_id(task_id)
         # task_id 优先：根据 ID 从 history 找到需求分析 md，跳过需求分析直接出测试点
         logger.info("========== Step 2/3: 测试点生成 ==========")
         if task_id:
@@ -483,6 +506,7 @@ def generate_test_points():
 
 def _run_generate_in_background(task_id: str, payload: dict):
     """后台线程中执行测试用例生成，结果写入 _generation_tasks"""
+    _set_thread_task_id(task_id)
     # 标记为 running
     with _generation_tasks_lock:
         task = _generation_tasks.setdefault(task_id, {
@@ -1025,17 +1049,21 @@ def get_history():
 
 @app.route('/api/logs')
 def get_logs():
-    """前端底部日志面板拉取增量日志（?since=<seq>）"""
+    """前端日志面板拉取增量日志（?since=<seq>&task_id=<id>）"""
     try:
         since = int(request.args.get('since', '0'))
     except ValueError:
         since = 0
+    filter_tid = request.args.get('task_id', '').strip()
     with _log_lock:
         items = [(s, t) for s, t in _log_buffer if s > since]
         latest = _log_seq
+    if filter_tid:
+        items = [(s, t) for s, t in items if filter_tid in t]
     return jsonify({
         'logs': [{'seq': s, 'text': t} for s, t in items],
-        'latest': latest
+        'latest': latest,
+        'filter_task_id': filter_tid,
     })
 
 
