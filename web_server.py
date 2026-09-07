@@ -232,14 +232,33 @@ _history_lock = threading.Lock()
 
 
 def _append_history(record: dict):
-    """追加一条需求分析历史记录到 JSON 文件（最新在前，最多保留100条）"""
+    """写入历史记录：同 task_id 则更新（以最新为准），否则新增；最新在前，最多保留100条"""
     try:
         with _history_lock:
             items = []
             if os.path.exists(HISTORY_FILE):
                 with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
                     items = json.load(f)
-            items.insert(0, record)
+            # upsert：同 task_id 合并更新
+            tid = record.get('task_id')
+            if tid:
+                for i, existing in enumerate(items):
+                    if existing.get('task_id') == tid:
+                        # 合并：新字段覆盖旧字段，旧字段保留
+                        merged = {**existing, **record}
+                        # created_at 保留原始创建时间，更新 updated_at
+                        merged['created_at'] = existing.get('created_at', record.get('created_at', ''))
+                        merged['updated_at'] = record.get('created_at', '')
+                        items[i] = merged
+                        # 移到最前
+                        items.pop(i)
+                        items.insert(0, merged)
+                        break
+                else:
+                    # 没找到同 task_id，新增
+                    items.insert(0, record)
+            else:
+                items.insert(0, record)
             items = items[:100]
             os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
             with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
@@ -373,7 +392,7 @@ def generate_test_points():
                 })
 
             # 把测试点 JSON 路径 + 测试点飞书文档 URL 写回 history，供 /api/generate task_id 查找
-            json_path = result.get('json_path')
+            json_path = result.get('json_path') or result.get('test_points_json_path', '')
             testpoint_feishu_url = result.get('feishu_url', '')
             if json_path and matched_item:
                 try:
