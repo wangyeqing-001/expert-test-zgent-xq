@@ -14,7 +14,7 @@
 - **JSON测试用例自动生成**：TestGenerator按 platform 路由3类 prompt，每条测试点生成≥3条（P0/P1）或≥2条（P2）JSON测试用例（含test_module/test_point/test_scenario/test_data/test_steps/expected_results/priority/status/remarks 9字段），按 test_module 分组后 H1→H2→6列表格写入飞书
 - **按端大类整合飞书文档**：客户端(App/Web/H5/通用/E2E)自动合并为1个文档存入客户端文件夹，backend→后端文件夹，admin→后台文件夹；task最多生成3个飞书文档（视需求覆盖端而定）
 - **异步生成 + 前端轮询**：新增 `/api/generate_async`（提交立即返回gen_task_id，后台线程执行）+ `/api/generate_status`（轮询进度/日志/结果）；前端提交后轮询进度面板（x/y批 + 最近日志），避免Flask worker被长耗时请求占用
-- **LLM截断自适应策略**：`_is_truncated` 检测JSON闭合/代码块闭合/结尾断句；截断后**递归拆子批**（binary split）而非翻倍max_tokens，最小粒度2点，最大深度4层；安全断言 `_MAX_POINTS_PER_BATCH=5` 兜底
+- **LLM截断自适应策略**：`_is_truncated` 检测JSON闭合/代码块闭合/结尾断句；截断后**递归拆子批**（binary split）而非翻倍max_tokens，最小粒度2点，最大深度4层；安全断言 `_MAX_POINTS_PER_BATCH=5` 兜底；**熔断器兜底**：连续 3 次 LLM 失败切 open 走空列表降级；**动态 timeout**：`min(30+len(pts)*30, 180)` 匹配 batch 大小
 - **max_tokens 12000**：测试点主提取 max_tokens 提升至 12000（支持输出 40~50 条测试点 JSON）；测试用例生成 token 翻倍重试上限同步提升到 12000；所有平台 batch_size 统一为3
 - **YAPI 全链路结构化注入**：`_summarize_res_schema` 将 response_schema 转为字段名+类型+必填+描述(50字)摘要，替代800字符硬截断；测试点生成 YAPI 截断提升至 12000，测试用例生成通过 `_build_yapi_context` 生成结构化摘要（方法路径+入参+出参schema）注入所有端 prompt；单接口200-300字符可覆盖30+接口
 - **下游数据传递**：测试点JSON（含scope/module/platform等字段+TestBatch批次）落盘，下游 TestGenerator 按 platform 路由对应 prompt 分批生成用例
@@ -24,7 +24,7 @@
 - **全端测试覆盖**：客户端 App (Appium)、Web/H5 (Playwright)、后端服务 (requests+pytest)、管理后台 (Playwright)、跨端 E2E (Playwright+requests)
 - **多渠道接入**：CLI交互式 + Web图形界面 + 飞书机器人对话 + 飞书链接独立脚本（均为Agent调用渠道）
 - **Web 体验优化**：五个tab（🚀一键全流程 / 需求分析 / 测试点 / 测试生成 / 🔍产物查询）；一键全流程支持选端过滤（app/backend/admin 复选框）；产物查询支持按 task_id 精确搜索 + 删除历史 + 查看全部；底部实时日志面板（增量轮询，print+logger 全量覆盖 via `_StdoutBridge` 桥接 stdout/stderr）
-- **YAPI 接口数据集成**：需求分析阶段从主文档+关联文档中提取 YAPI 链接（清洗前提取，不丢失），绑定 task_id 存入 history.json；测试点生成时通过内部接口 `getInterfaceData` 拉取接口详情（路径/方法/入参/出参），标准化映射后注入 prompt，AI 为每个接口打标签（本次新增/修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review
+- **YAPI 接口数据集成**：需求分析阶段从主文档+关联文档中提取 YAPI 链接（清洗前提取，不丢失），绑定 task_id 存入 history.json；测试点生成时通过内部接口 `getInterfaceData` 拉取接口详情（路径/方法/入参/出参），标准化映射后注入 prompt，AI 为每个接口打标签（本次新增/修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review；**TTL 缓存 24h**：相同 URL 重复拉取直接返回缓存结果（日志 `✓[YAPI缓存命中]`），避免重复调用 YAPI 服务
 - **飞书日志上下文标注**：日志区分"主文档"与"关联文档"拉取，关联文档失败自动降级为WARNING并跳过（不影响主文档分析）
 - **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性；YAPI 接口拉取失败（404/鉴权/超时）自动跳过不阻塞，无接口数据时 AI 仅基于 PRD 正常工作
 - **Flask稳定性**：`debug=False` + `use_reloader=False`，防止 reloader 重启丢失后台线程；所有 `_agent_lock` 用 `with` 上下文管理器确保异常时释放
@@ -36,6 +36,12 @@
 - **History 管理**：DELETE `/api/history` 按 task_id 删除（清理本地 md/json + history.json，保留飞书云端文档）；`_merge_feishu_docs` 按 group 键合并新旧 docs，不同端互不覆盖，同端新结果覆盖旧结果
 - **平台过滤**：`_PLATFORM_GROUP_EXPANSION` 映射 app→{app,web,h5,common,e2e}；generate_async 和 pipeline 均支持 selected_platforms 参数，过滤后只生成勾选端
 - **后验检查 + scope 分布日志**：测试点生成后自动打印 scope 分布；backend/admin <3 但有 YAPI 时自动 Warning
+- **P0-1 熔断器 CircuitBreaker**：`_CircuitBreaker` 三态（closed→open→half_open），连续 3 次 LLM 失败切 open 冷却 60s，execute_batch 入口检查 `.can_execute()`；open 状态跳过 LLM 走空列表降级，防止 LLM 异常时后台线程雪崩
+- **P0-2 动态 HTTP timeout**：`LLMClient.generate(timeout=None)` 参数化；execute_batch 两处 LLM 调用 `min(30 + len(pts)*30, 180)` —— 3 测试点→120s，20→180s 封顶，0→30s 保底；解决大 batch 正常生成也会被 120s 固定 timeout 截断的问题
+- **P1-5 YAPI 接口 TTL 缓存**：`_fetch_yapi_interface` 内存缓存 `_YAPI_CACHE` + `_YAPI_CACHE_LOCK` + TTL=24h；成功拉取后写缓存，下次相同 URL 直接返回（日志 `✓[YAPI缓存命中]`）；只缓存成功结果，失败不占缓存；同 PRD 多次生成测试点时节省 30~60s 重复拉取时间
+- **P1-7 飞书写入重试（已存在）**：`core/feishu_client.py` 所有 HTTP 调用已被 `@retry(max_retries=3)` 装饰器包裹，create_doc / create_doc_from_struct 自动重试
+- **LLM 日志降噪**：LLM client 去掉返回内容全量 print（刷屏），改为摘要式 `[LLM→model] 返回 N字符`；上层 agent 日志已带 task_id / batch 前缀，trace_id 贯穿
+
 
 
 ---
