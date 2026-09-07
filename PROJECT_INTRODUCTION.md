@@ -23,7 +23,7 @@
 - **多LLM提供商支持**：阿里云百炼(DashScope)、DeepSeek、OpenAI GPT-4，三级优先级自动切换
 - **全端测试覆盖**：客户端 App (Appium)、Web/H5 (Playwright)、后端服务 (requests+pytest)、管理后台 (Playwright)、跨端 E2E (Playwright+requests)
 - **多渠道接入**：CLI交互式 + Web图形界面 + 飞书机器人对话 + 飞书链接独立脚本（均为Agent调用渠道）
-- **Web 体验优化**：实时日志面板（增量轮询展示）、分析期间按钮置灰防重复提交、需求分析历史记录（持久化原始文档链接+生成飞书文档链接+任务ID，分页加载：默认3条+每次加载更多5条，可点击回溯）
+- **Web 体验优化**：三个tab（需求分析/测试点/测试用例）均带历史记录区（懒加载+刷新按钮），每条记录展示四链路：📄来源/✨分析/🎯测试点/🧪用例(按端分组+用例数)；底部实时日志面板（增量轮询展示，print+logger全量覆盖 via `_StdoutBridge` 桥接sys.stdout/stderr），分析期间按钮置灰防重复提交
 - **YAPI 接口数据集成**：需求分析阶段从主文档+关联文档中提取 YAPI 链接（清洗前提取，不丢失），绑定 task_id 存入 history.json；测试点生成时通过内部接口 `getInterfaceData` 拉取接口详情（路径/方法/入参/出参），标准化映射后注入 prompt，AI 为每个接口打标签（本次新增/修改/存量复用-建议回归/存量复用-无需测试），不丢弃任何接口，输出接口索引表供测试人员 review
 - **飞书日志上下文标注**：日志区分"主文档"与"关联文档"拉取，关联文档失败自动降级为WARNING并跳过（不影响主文档分析）
 - **降级容错机制**：LLM失败时自动降级到确定性渲染/规则模板，保证系统可用性；YAPI 接口拉取失败（404/鉴权/超时）自动跳过不阻塞，无接口数据时 AI 仅基于 PRD 正常工作
@@ -39,7 +39,7 @@
 PythonProject_testagent/
 ├── agents/                        # 业务智能体层
 │   ├── base_agent.py             # Agent基类（ReAct标准接口）
-│   ├── _prompt_utils.py          # Prompt加载工具（共享，占位符校验+注入）
+│   ├── _prompt_utils.py          # Prompt加载工具（共享，占位符注入+缺失静默跳过）
 │   ├── requirement_analyzer/     # 需求分析Agent
 │   │   ├── agent.py              # 双链路分析 + 飞书struct直写 + 原始文档透出
 │   │   ├── prompts.md            # 结构化JSON输出提示词（主链路）
@@ -49,7 +49,7 @@ PythonProject_testagent/
 │   │   ├── prd_to_testpoints.md  # prd直提提示词（主辅材料+门控指令+scope字段）
 │   │   └── constraints_extract.md# 约束清单提取提示词（防遗漏索引）
 │   ├── test_generator/           # 测试用例JSON生成Agent（截断自适应拆批）
-│   │   ├── agent.py              # 场景→可执行测试代码（按platform路由prompt）
+│   │   ├── agent.py              # 测试点→JSON用例（按platform路由prompt+递归拆子批）
 │   │   ├── client_test.md       # 客户端测试用例JSON提示词（App/Web/H5/通用/E2E，framework参数化）
 │   │   ├── admin_test.md        # 管理后台测试用例JSON提示词
 │   │   └── backend_test.md     # 后端服务测试用例JSON提示词
@@ -173,7 +173,7 @@ LLM双链路生成分析文档（h1-h3/段落/列表/表格/code 8种节点）
       ↓ _publish_points：飞书文档正文（溯源链接 + 概述 + 按端H2分节表格 + 接口索引表），不二次调LLM
 
 链路2：code分析（source='code'，降级路径）
-  _generate_by_rules 规则生成scenarios → _save_and_publish_table 确定性渲染
+  _generate_by_rules 规则生成scenarios → _save_and_publish_table 确定性渲染（testpoints_table.md已移除，LLM表格链路不再需要）
 ```
 
 **统一产出（两条链路同格式）**：
@@ -421,9 +421,11 @@ python web_server.py --port 5001
 访问：http://localhost:5001
 
 **界面功能**：
-- 需求分析 / 测试点生成 / 测试生成 三个标签页，支持飞书文档链接导入
-- 底部实时日志面板（增量轮询，可折叠/暂停/清空），分析期间按钮置灰防重复提交
-- 需求分析面板下方「历史记录」区，展示可点击的原始需求文档链接与生成的需求分析飞书文档链接
+- 需求分析 / 测试点生成 / 测试生成 三个标签页，支持飞书文档链接导入或 task_id 跳过需求分析
+- 底部实时日志面板（增量轮询，可折叠/暂停/清空），print() + logger.* 全量覆盖（`_StdoutBridge` 桥接 sys.stdout/stderr → 内存缓冲 → `/api/logs`）
+- 三个 tab 均带「历史记录」区（懒加载，切换 tab 时首次加载），每条记录展示四链路：📄原始需求文档 | ✨需求分析文档 | 🎯测试点 | 🧪用例(客户端N·后端N·管理后台N)
+- 分析/生成期间按钮置灰防重复提交，DOMContentLoaded 显式重置全局锁
+- 测试用例生成完成后 feishu_docs 自动写回 history.json，历史记录可点击回溯
 
 > 启动时使用 `use_reloader=False`，避免长耗时请求（需求分析约1-2分钟）因代码改动触发 reloader 重启而被中断。
 
@@ -776,9 +778,8 @@ LLM调用成功 → 智能生成高质量代码
 
 ### 7. Prompt与代码分离
 - 每个Agent目录下直接存放 `.md` 纯文本文件，整个文件即prompt指令
-- `agents/_prompt_utils.py` 为共享加载器，负责读取md、校验占位符、注入参数
+- `agents/_prompt_utils.py` 为共享加载器，负责读取md、注入占位符参数；kwargs中有模板里不存在的占位符时**静默跳过**（debug日志），不报错——允许 prompt 按需选择可用字段
 - 编辑prompt无需理解Python语法，不会误删代码
-- 启动时自动校验占位符是否存在，缺失即报错
 
 ### 8. 主辅材料双输入设计（测试点prd直提）
 - **主材料**：原始PRD全文，唯一事实来源，所有测试点必须回溯至PRD原文
@@ -838,4 +839,4 @@ LLM调用成功 → 智能生成高质量代码
 
 ---
 
-**最后更新时间**：2026-09-04
+**最后更新时间**：2026-09-07
