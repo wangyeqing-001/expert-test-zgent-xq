@@ -357,13 +357,51 @@
 
         <div class="main-panel">
             <div class="tabs">
-                <div class="tab active" onclick="switchTab('requirement', this)">需求分析</div>
+                <div class="tab active" onclick="switchTab('pipeline', this)">🚀 一键全流程</div>
+                <div class="tab" onclick="switchTab('requirement', this)">需求分析</div>
                 <div class="tab" onclick="switchTab('testpoints', this)">测试点生成</div>
                 <div class="tab" onclick="switchTab('generate', this)">测试生成</div>
+                <div class="tab" onclick="switchTab('lookup', this)">🔍 产物查询</div>
+            </div>
+
+            <!-- 🚀 一键全流程面板（主入口） -->
+            <div id="pipeline-panel" class="content">
+                <div class="input-section">
+                    <label style="color:#d46b08;font-weight:bold;margin-bottom:8px;display:block;font-size:15px">
+                        🚀 一键全流程（飞书URL → 自动完成 需求分析 → 测试点 → 测试用例 → 飞书文档）
+                    </label>
+                    <input 
+                        type="text" 
+                        id="pipeline-doc-url" 
+                        placeholder="粘贴飞书文档链接，如：https://xxx.feishu.cn/docx/xxxxx 或 https://xxx.feishu.cn/wiki/xxxxx"
+                        style="width:100%;padding:10px 14px;border:2px solid #ffd591;border-radius:6px;font-size:14px;margin-bottom:12px;background:#fffbf0"
+                    />
+                    <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+                        <span style="font-size:13px;color:#d46b08;font-weight:bold">🎯 选端：</span>
+                        <label style="font-size:13px"><input type="checkbox" class="pipe-cb" value="app" checked> 客户端</label>
+                        <label style="font-size:13px"><input type="checkbox" class="pipe-cb" value="backend" checked> 后端</label>
+                        <label style="font-size:13px"><input type="checkbox" class="pipe-cb" value="admin" checked> 管理后台</label>
+                        <label style="font-size:13px;color:#999"><input type="checkbox" id="pipe-all-cb" checked onchange="document.querySelectorAll('.pipe-cb').forEach(c=>c.checked=this.checked)"> 全选/清空</label>
+                    </div>
+                    <div style="font-size:12px;color:#888;margin-bottom:12px">💡 填写飞书文档链接后点启动，系统会自动串联三阶段，中间无需人工干预</div>
+                    <button class="btn" onclick="startPipeline()" id="pipeline-btn" style="background:linear-gradient(135deg,#fa8c16,#fa541c);color:white;font-weight:bold;padding:12px 32px;font-size:15px;border:none;box-shadow:0 2px 8px rgba(250,140,22,0.4)">
+                        🚀 启动全流程
+                    </button>
+                </div>
+
+                <!-- Pipeline 进度显示 -->
+                <div id="pipeline-progress" class="result-section" style="display:none;margin-top:16px">
+                    <div class="result-header">
+                        <h3>⚡ 执行进度</h3>
+                    </div>
+                    <div id="pipeline-step-badges" style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap"></div>
+                    <div id="pipeline-logs" style="max-height:300px;overflow-y:auto;font-size:12px;color:#555;font-family:monospace;background:#fafafa;padding:10px;border-radius:4px;border:1px solid #eee"></div>
+                    <div id="pipeline-final" style="margin-top:12px"></div>
+                </div>
             </div>
 
             <!-- 需求分析面板 -->
-            <div id="requirement-panel" class="content">
+            <div id="requirement-panel" class="content" style="display:none">
                 <div class="input-section">
                     <label for="req-query">输入查询：</label>
                     <textarea id="req-query" placeholder="例如：分析login.py的测试需求"></textarea>
@@ -393,7 +431,7 @@
                             💡 提示：导入后将自动解析PRD内容并生成分析查询
                         </small>
                     </div>
-                    
+
                     <div class="examples">
                         <h4>💡 示例（点击快速填充）：</h4>
                         <ul>
@@ -468,7 +506,20 @@
             <div id="generate-panel" class="content" style="display:none;">
                 <div class="input-section">
                     <label for="gen-task-id">🆔 任务ID（输入后从测试点JSON加载batches，逐批按端生成测试代码）：</label>
-                    <input type="text" id="gen-task-id" placeholder="REQ-20260904-101235 或从测试点生成结果复制" style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:4px;margin-bottom:8px;font-family:monospace">
+                    <div style="display:flex;gap:8px;margin-bottom:8px">
+                        <input type="text" id="gen-task-id" placeholder="REQ-20260904-101235 或从测试点生成结果复制" style="flex:1;padding:8px 12px;border:1px solid #ddd;border-radius:4px;font-family:monospace">
+                        <button class="btn" type="button" onclick="queryPlatforms()" style="white-space:nowrap;background:#1890ff">🔍 查询涉及端</button>
+                    </div>
+                    <div id="gen-platform-filter" style="display:none;padding:12px;background:#f0f5ff;border:1px solid #adc6ff;border-radius:6px;margin-bottom:12px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                            <strong style="color:#1d39c4">🎯 选择要生成的端（留空=全部生成）</strong>
+                            <div>
+                                <button class="btn" type="button" onclick="selectAllPlatforms(true)" style="padding:2px 10px;font-size:12px">全选</button>
+                                <button class="btn" type="button" onclick="selectAllPlatforms(false)" style="padding:2px 10px;font-size:12px">清空</button>
+                            </div>
+                        </div>
+                        <div id="gen-platform-checkboxes" style="display:flex;flex-wrap:wrap;gap:12px"></div>
+                    </div>
                     <div style="font-size:12px;color:#888;margin-bottom:12px">💡 填了任务ID就走批量生成：按端路由prompt + 自动上传到对应飞书文件夹</div>
 
                     <label for="gen-doc">或手动输入需求文档（可选，无任务ID时使用）：</label>
@@ -510,6 +561,27 @@
                     </div>
                 </div>
             </div>
+
+            <!-- 🔍 产物查询面板 -->
+            <div id="lookup-panel" class="content" style="display:none;">
+                <div class="input-section">
+                    <label style="font-weight:bold;margin-bottom:8px;display:block;font-size:15px">
+                        🔍 产物查询（通过 task_id 查看完整四链产物）
+                    </label>
+                    <div style="display:flex;gap:8px;margin-bottom:8px">
+                        <input 
+                            type="text" 
+                            id="lookup-task-id" 
+                            placeholder="输入 task_id，如 REQ-20260907-134318 或 pipeline id"
+                            style="flex:1;padding:10px 14px;border:2px solid #1890ff;border-radius:6px;font-size:14px;font-family:monospace"
+                        />
+                        <button class="btn" onclick="lookupByTaskId()" style="background:#1890ff;color:white;padding:10px 20px">🔍 查询</button>
+                    </div>
+                    <button class="btn" onclick="showAllHistory()" style="padding:6px 14px;font-size:13px">📜 查看全部历史</button>
+                </div>
+
+                <div id="lookup-result" class="result-section" style="display:none;margin-top:16px"></div>
+            </div>
         </div>
     </div>
 
@@ -544,6 +616,11 @@
             if (boxId && !_historyLoaded.has(tab)) {
                 _historyLoaded.add(tab);
                 loadHistory(boxId);
+            }
+            // lookup tab 直接加载全部历史
+            if (tab === 'lookup' && !_historyLoaded.has('lookup')) {
+                _historyLoaded.add('lookup');
+                showAllHistory();
             }
         }
 
@@ -825,6 +902,45 @@
             }
         }
 
+        // 查询 task_id 涉及的端，渲染 checkbox 供用户勾选
+        let _cachedPlatforms = []; // 缓存最近一次查询结果
+        async function queryPlatforms() {
+            const taskId = document.getElementById('gen-task-id').value.trim();
+            if (!taskId) { alert('请先输入任务ID'); return; }
+            const filterDiv = document.getElementById('gen-platform-filter');
+            const cbDiv = document.getElementById('gen-platform-checkboxes');
+            cbDiv.innerHTML = '<span style="color:#888">查询中...</span>';
+            filterDiv.style.display = 'block';
+            try {
+                const resp = await fetch(`/api/testpoint_platforms?task_id=${encodeURIComponent(taskId)}`);
+                const data = await resp.json();
+                if (!data.success) {
+                    cbDiv.innerHTML = `<span style="color:#ff4d4f">查询失败: ${data.error}</span>`;
+                    return;
+                }
+                _cachedPlatforms = data.platforms || [];
+                if (_cachedPlatforms.length === 0) {
+                    cbDiv.innerHTML = '<span style="color:#faad14">该任务暂无测试点数据</span>';
+                    return;
+                }
+                // 渲染 checkbox
+                cbDiv.innerHTML = _cachedPlatforms.map(p => `
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;padding:4px 10px;background:#fff;border:1px solid #d9d9d9;border-radius:4px;font-size:13px">
+                        <input type="checkbox" class="gen-platform-cb" value="${p.platform}" checked>
+                        ${p.group}（${p.count}条）
+                    </label>
+                `).join('');
+            } catch (err) {
+                cbDiv.innerHTML = `<span style="color:#ff4d4f">网络错误: ${err.message}</span>`;
+            }
+        }
+
+        // 全选 / 清空 平台 checkbox
+        function selectAllPlatforms(all) {
+            const cbs = document.querySelectorAll('.gen-platform-cb');
+            cbs.forEach(cb => cb.checked = all);
+        }
+
         // 生成测试
         async function generateTest() {
             if (isProcessing) return;
@@ -842,12 +958,21 @@
 
             try {
                 let data;
+                // 收集用户勾选的平台（如果查询过的话）
+                const selectedPlatforms = Array.from(document.querySelectorAll('.gen-platform-cb:checked'))
+                    .map(cb => cb.value);
+                const platformFilterActive = selectedPlatforms.length > 0;
                 if (taskId) {
                     // task_id 路径：走异步生成 + 轮询
+                    const postBody = {task_id: taskId};
+                    if (platformFilterActive) {
+                        postBody.selected_platforms = selectedPlatforms;
+                        console.log('[generateTest] 平台过滤:', selectedPlatforms);
+                    }
                     const submitResp = await fetch('/api/generate_async', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({task_id: taskId})
+                        body: JSON.stringify(postBody)
                     });
                     const submitData = await submitResp.json();
                     if (!submitData.success) {
@@ -1095,6 +1220,292 @@
                 btn.textContent = '导入';
                 alert('网络错误: ' + error.message);
             }
+        }
+
+        // ============ 一键全流程 Pipeline ============
+        async function startPipeline() {
+            const docUrl = document.getElementById('pipeline-doc-url').value.trim();
+            if (!docUrl) { alert('请输入飞书文档链接'); return; }
+
+            // 收集选端
+            const cbs = document.querySelectorAll('.pipe-cb:checked');
+            const selectedPlatforms = Array.from(cbs).map(cb => cb.value);
+            if (selectedPlatforms.length === 0) { alert('请至少勾选一个端'); return; }
+
+            const btn = document.getElementById('pipeline-btn');
+            btn.disabled = true;
+            btn.textContent = '🚀 执行中...';
+
+            // 清空进度区域
+            const progDiv = document.getElementById('pipeline-progress');
+            progDiv.style.display = 'block';
+            document.getElementById('pipeline-step-badges').innerHTML = '';
+            document.getElementById('pipeline-logs').innerHTML = '<div style="color:#999">等待启动...</div>';
+            document.getElementById('pipeline-final').innerHTML = '';
+
+            const STEPS = [
+                {label: 'Step 1: 需求分析', emoji: '📄'},
+                {label: 'Step 2: 测试点生成', emoji: '🎯'},
+                {label: 'Step 3: 测试用例生成', emoji: '✅'},
+            ];
+            function renderStepBadges(currentStep) {
+                document.getElementById('pipeline-step-badges').innerHTML = STEPS.map((s, i) => {
+                    let color = '#ddd', textColor = '#999';
+                    if (i < currentStep) { color = '#52c41a'; textColor = '#fff'; }
+                    else if (i === currentStep) { color = '#fa8c16'; textColor = '#fff'; }
+                    return `<div style="padding:4px 10px;border-radius:4px;font-size:12px;background:${color};color:${textColor};white-space:nowrap">
+                        ${s.emoji} ${s.label}${i === currentStep ? ' ⏳' : ''}
+                    </div>`;
+                }).join('');
+            }
+            renderStepBadges(0);
+
+            try {
+                const submitResp = await fetch('/api/pipeline_async', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({doc_url: docUrl, selected_platforms: selectedPlatforms})
+                });
+                const submitData = await submitResp.json();
+                if (!submitData.success) {
+                    btn.disabled = false;
+                    btn.textContent = '🚀 启动全流程';
+                    document.getElementById('pipeline-logs').innerHTML = `<div style="color:#ff4d4f">启动失败: ${submitData.error}</div>`;
+                    return;
+                }
+                const pid = submitData.pipeline_task_id;
+                document.getElementById('pipeline-logs').innerHTML = `<div style="color:#1890ff">✓ Pipeline已启动, id=${pid}</div>`;
+
+                const MAX_WAIT = 900; const INTERVAL = 4000;
+                const startTime = Date.now(); let lastLogCount = 0;
+
+                while (Date.now() - startTime < MAX_WAIT * 1000) {
+                    await new Promise(r => setTimeout(r, INTERVAL));
+                    const sResp = await fetch(`/api/pipeline_status?pipeline_task_id=${encodeURIComponent(pid)}`);
+                    const s = await sResp.json();
+                    renderStepBadges(s.step || 0);
+
+                    const newLogs = (s.logs || []).slice(lastLogCount);
+                    lastLogCount = (s.logs || []).length;
+                    if (newLogs.length > 0) {
+                        const logDiv = document.getElementById('pipeline-logs');
+                        newLogs.forEach(l => {
+                            const line = document.createElement('div');
+                            line.textContent = `[${l.ts}] ${l.text}`;
+                            if (l.text.startsWith('✗') || l.text.includes('失败')) line.style.color = '#ff4d4f';
+                            else if (l.text.startsWith('✓')) line.style.color = '#52c41a';
+                            else if (l.text.startsWith('🎯')) line.style.color = '#fa8c16';
+                            logDiv.appendChild(line);
+                        });
+                        logDiv.scrollTop = logDiv.scrollHeight;
+                    }
+
+                    if (s.status === 'completed') {
+                        renderStepBadges(3); showPipelineFinal(s.result);
+                        btn.disabled = false; btn.textContent = '🚀 启动全流程'; return;
+                    } else if (s.status === 'failed') {
+                        document.getElementById('pipeline-final').innerHTML =
+                            `<div style="color:#ff4d4f;padding:10px;background:#fff2f0;border-radius:4px;border:1px solid #ffccc7">❌ Pipeline 失败: ${s.error || '未知错误'}</div>`;
+                        btn.disabled = false; btn.textContent = '🚀 启动全流程'; return;
+                    }
+                }
+                document.getElementById('pipeline-final').innerHTML =
+                    `<div style="color:#faad14;padding:10px;background:#fffbe6;border-radius:4px;border:1px solid #ffe58f">⏳ 轮询超时（15分钟），请稍后用 id=${pid} 手动查询</div>`;
+                btn.disabled = false; btn.textContent = '🚀 启动全流程';
+            } catch (err) {
+                document.getElementById('pipeline-final').innerHTML = `<div style="color:#ff4d4f">网络错误: ${err.message}</div>`;
+                btn.disabled = false; btn.textContent = '🚀 启动全流程';
+            }
+        }
+
+        function showPipelineFinal(result) {
+            if (!result) return;
+            const docs = result.feishu_docs || [];
+            document.getElementById('pipeline-final').innerHTML = `
+                <div style="padding:12px;background:#f6ffed;border:1px solid #b7eb8f;border-radius:6px">
+                    <div style="font-weight:bold;color:#389e0d;margin-bottom:8px">🎉 Pipeline 全部完成！</div>
+                    <div style="font-size:13px;color:#333;margin-bottom:8px">
+                        task_id: <code>${result.task_id}</code> |
+                        需求分析: <a href="${result.req_feishu_url}" target="_blank">${result.req_feishu_url ? '飞书文档' : '（无）'}</a> |
+                        测试点: ${result.testpoint_feishu_url ? `<a href="${result.testpoint_feishu_url}" target="_blank">${result.testpoint_total+'条'}</a>` : '（无）'}
+                    </div>
+                    <div style="font-size:13px;color:#333;margin-bottom:8px">生成测试用例共 <b style="color:#389e0d">${result.total_cases}</b> 条</div>
+                    ${docs.length > 0 ? `<div style="font-size:13px;margin-bottom:4px">📁 飞书文档：</div>
+                        <ul style="margin:0;padding-left:20px">${docs.map(d =>
+                            `<li>${d.group}（${d.case_count}条）→ <a href="${d.feishu_url}" target="_blank">${d.feishu_url}</a></li>`
+                        ).join('')}</ul>` : ''}
+                    <div style="font-size:12px;color:#999;margin-top:8px">💡 三个 tab 的历史记录里可以查看完整四链</div>
+                </div>`;
+        }
+
+        // ============ 产物查询 ============
+        async function deleteTask(taskId, btnEl) {
+            if (!confirm(`确定删除 task_id=${taskId}？\n\n将清理: history.json 记录 + 本地 md/json 文件\n飞书文档（云端）不会被删除`)) return;
+            btnEl.disabled = true;
+            btnEl.textContent = '删除中...';
+            try {
+                const resp = await fetch('/api/history', {
+                    method: 'DELETE',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({task_id: taskId})
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    const cleaned = data.cleaned_files && data.cleaned_files.length > 0
+                        ? `\n已清理 ${data.cleaned_files.length} 个本地文件` : '';
+                    alert(`✓ 删除成功！${cleaned}`);
+                    // 刷新当前显示
+                    if (document.getElementById('lookup-result').style.display !== 'none') {
+                        // 如果在全历史视图，刷新全部
+                        if (btnEl.closest('#lookup-result') && !document.getElementById('lookup-task-id').value.trim()) {
+                            showAllHistory();
+                        } else {
+                            // 如果在单条查询视图，清空
+                            document.getElementById('lookup-result').innerHTML =
+                                `<div style="color:#52c41a;padding:12px;background:#f6ffed;border-radius:4px">✓ 已删除 task_id=${taskId}，<a href="javascript:showAllHistory()">点击刷新全部历史</a></div>`;
+                        }
+                    }
+                } else {
+                    alert('删除失败: ' + (data.error || '未知错误'));
+                    btnEl.disabled = false;
+                    btnEl.textContent = '🗑 删除';
+                }
+            } catch (err) {
+                alert('网络错误: ' + err.message);
+                btnEl.disabled = false;
+                btnEl.textContent = '🗑 删除';
+            }
+        }
+
+        async function lookupByTaskId() {
+            const tid = document.getElementById('lookup-task-id').value.trim();
+            if (!tid) { alert('请输入 task_id'); return; }
+            const resultDiv = document.getElementById('lookup-result');
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div style="color:#888">查询中...</div>';
+
+            try {
+                const resp = await fetch('/api/history');
+                const data = await resp.json();
+                const items = data.items || [];
+                // 精确匹配 task_id 或包含匹配
+                const found = items.find(it => it.task_id === tid)
+                           || items.find(it => (it.task_id || '').includes(tid))
+                           || items.find(it => (it.source_title || '').includes(tid))
+                           || items.find(it => (it.source_doc_url || '').includes(tid));
+
+                resultDiv.innerHTML = found ? renderLookupCard(found) :
+                    `<div style="color:#ff4d4f;padding:12px;background:#fff2f0;border-radius:4px;border:1px solid #ffccc7">
+                        ❌ 未找到 task_id = <code>${tid}</code> 的产物记录
+                        <div style="font-size:12px;color:#999;margin-top:6px">可用的 task_id 有: ${items.map(i=>`<code>${i.task_id}</code>`).join(', ')}</div>
+                    </div>`;
+            } catch (err) {
+                resultDiv.innerHTML = `<div style="color:#ff4d4f">网络错误: ${err.message}</div>`;
+            }
+        }
+
+        async function showAllHistory() {
+            const resultDiv = document.getElementById('lookup-result');
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div style="color:#888">加载中...</div>';
+            try {
+                const resp = await fetch('/api/history');
+                const data = await resp.json();
+                const items = data.items || [];
+                if (items.length === 0) {
+                    resultDiv.innerHTML = '<div style="color:#999;padding:20px;text-align:center">暂无历史记录</div>';
+                    return;
+                }
+                resultDiv.innerHTML = `
+                    <div style="font-size:13px;color:#666;margin-bottom:12px">共 ${items.length} 条记录，点击 task_id 展开详情</div>
+                    ${items.map(item => renderLookupCard(item, true)).join('')}`;
+            } catch (err) {
+                resultDiv.innerHTML = `<div style="color:#ff4d4f">加载失败: ${err.message}</div>`;
+            }
+        }
+
+        function renderLookupCard(item, compact=false) {
+            const taskId = item.task_id || '(未知)';
+            const title = item.source_title || '(无标题)';
+            const createdAt = item.created_at || '';
+            const updatedAt = item.updated_at || '';
+
+            // 四链
+            const linkSrc = item.source_doc_url ? `<a href="${item.source_doc_url}" target="_blank">📄 原文</a>` : '<span style="color:#bbb">📄 原文</span>';
+            const linkReq = item.feishu_url ? `<a href="${item.feishu_url}" target="_blank">📋 需求分析</a>` : '<span style="color:#bbb">📋 需求分析</span>';
+            const linkTP = item.testpoint_feishu_url ? `<a href="${item.testpoint_feishu_url}" target="_blank">🎯 测试点</a>` : '<span style="color:#bbb">🎯 测试点</span>';
+
+            // 测试用例（可能多个，按端）
+            const caseDocs = item.testcase_feishu_docs || [];
+            const totalCases = item.testcase_total || 0;
+            let linkGen = '';
+            if (caseDocs.length > 0) {
+                linkGen = caseDocs.map(d =>
+                    `<div style="margin-top:4px;padding:4px 8px;background:#f6ffed;border-radius:3px;font-size:12px">
+                        <span style="color:#389e0d;font-weight:bold">${d.group}</span>（${d.case_count}条）→
+                        <a href="${d.feishu_url}" target="_blank">打开飞书</a>
+                    </div>`
+                ).join('');
+            } else if (totalCases > 0) {
+                linkGen = `<span style="color:#fa8c16">${totalCases}条用例（飞书文档未记录）</span>`;
+            } else {
+                linkGen = '<span style="color:#bbb">✅ 测试用例</span>';
+            }
+
+            const header = `
+                <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:6px">
+                    <div style="font-weight:bold;color:#1890d9">${title}</div>
+                    <button class="btn" style="padding:2px 10px;font-size:12px;background:#ff4d4f;color:white;border:none;cursor:pointer" onclick="deleteTask('${taskId}', this)">🗑 删除</button>
+                </div>
+                <div style="font-size:12px;color:#999;margin-bottom:10px">
+                    task_id: <code>${taskId}</code>
+                    ${createdAt ? ` · 创建: ${createdAt}` : ''}
+                    ${updatedAt ? ` · 更新: ${updatedAt}` : ''}
+                </div>`;
+
+            if (compact) {
+                // 紧凑模式：显示四链网格
+                return `
+                <div style="padding:12px;background:#fff;border:1px solid #e8e8e8;border-radius:6px;margin-bottom:12px">
+                    ${header}
+                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;font-size:13px">
+                        <div style="text-align:center;padding:8px;background:#f5f5f5;border-radius:4px">${linkSrc}</div>
+                        <div style="text-align:center;padding:8px;background:#f5f5f5;border-radius:4px">${linkReq}</div>
+                        <div style="text-align:center;padding:8px;background:#f5f5f5;border-radius:4px">${linkTP}</div>
+                        <div style="padding:8px;background:#f5f5f5;border-radius:4px">
+                            <div style="text-align:center;margin-bottom:4px">✅ 测试用例</div>
+                            ${caseDocs.length > 0 ? caseDocs.map(d =>
+                                `<div style="font-size:11px;margin-top:2px"><span style="color:#389e0d">${d.group}</span> <a href="${d.feishu_url}" target="_blank">(${d.case_count})</a></div>`
+                            ).join('') : totalCases > 0 ? `<div style="font-size:11px;color:#fa8c16">${totalCases}条</div>` : '<div style="font-size:11px;color:#bbb">未生成</div>'}
+                        </div>
+                    </div>
+                </div>`;
+            }
+
+            // 详情模式：完整卡片
+            return `
+                <div style="padding:16px;background:#fff;border:2px solid #1890ff;border-radius:8px">
+                    ${header}
+                    <div style="display:flex;flex-direction:column;gap:12px;margin-top:12px">
+                        <div style="padding:10px;background:#f0f5ff;border-left:3px solid #1890ff;border-radius:4px">
+                            <div style="font-size:12px;color:#666;margin-bottom:4px">① 原始需求文档</div>
+                            ${item.source_doc_url ? `<a href="${item.source_doc_url}" target="_blank">${item.source_doc_url}</a>` : '<span style="color:#999">（无记录）</span>'}
+                        </div>
+                        <div style="padding:10px;background:#f6ffed;border-left:3px solid #52c41a;border-radius:4px">
+                            <div style="font-size:12px;color:#666;margin-bottom:4px">② 需求分析文档</div>
+                            ${item.feishu_url ? `<a href="${item.feishu_url}" target="_blank">${item.feishu_url}</a>` : '<span style="color:#999">（未生成）</span>'}
+                        </div>
+                        <div style="padding:10px;background:#fffbe6;border-left:3px solid #faad14;border-radius:4px">
+                            <div style="font-size:12px;color:#666;margin-bottom:4px">③ 测试点文档</div>
+                            ${item.testpoint_feishu_url ? `<a href="${item.testpoint_feishu_url}" target="_blank">${item.testpoint_feishu_url}</a>` : '<span style="color:#999">（未生成）</span>'}
+                            ${item.testpoints_json ? `<div style="font-size:11px;color:#999;margin-top:2px">JSON: ${item.testpoints_json}</div>` : ''}
+                        </div>
+                        <div style="padding:10px;background:#fff0f6;border-left:3px solid #eb2f96;border-radius:4px">
+                            <div style="font-size:12px;color:#666;margin-bottom:4px">④ 测试用例文档（共 ${totalCases} 条）</div>
+                            ${linkGen}
+                        </div>
+                    </div>
+                </div>`;
         }
 
         // 从文本中提取文件路径

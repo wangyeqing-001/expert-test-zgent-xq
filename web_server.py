@@ -138,6 +138,48 @@ _agent_lock = threading.Lock()
 _generation_tasks: dict[str, dict] = {}
 _generation_tasks_lock = threading.Lock()
 
+# ---- 全流程 Pipeline 任务状态 ----
+# pipeline_task_id → {status, step, step_total, progress, total, result, error, created_at, started_at, finished_at, logs}
+_pipeline_tasks: dict[str, dict] = {}
+_pipeline_tasks_lock = threading.Lock()
+
+# ---- 平台组展开（前端 checkbox 值 → 后端实际 platform 字段值）----
+# 选"客户端"组时覆盖 app/web/h5/common/e2e 五个变体；选"后端"就只覆盖 backend
+_PLATFORM_GROUP_EXPANSION: dict[str, set] = {
+    'app':     {'app', 'web', 'h5', 'common', 'e2e'},
+    'web':     {'app', 'web', 'h5', 'common', 'e2e'},
+    'h5':      {'app', 'web', 'h5', 'common', 'e2e'},
+    'common':  {'app', 'web', 'h5', 'common', 'e2e'},
+    'e2e':     {'app', 'web', 'h5', 'common', 'e2e'},
+    'backend': {'backend'},
+    'admin':   {'admin'},
+}
+
+def _expand_platforms(selected: list | None) -> set[str] | None:
+    """把用户选的平台值（可能是组名如 app，也可能是具体值）展开成后端 platform 字段的完整集合"""
+    if not selected:
+        return None
+    expanded: set[str] = set()
+    for s in selected:
+        if s in _PLATFORM_GROUP_EXPANSION:
+            expanded |= _PLATFORM_GROUP_EXPANSION[s]
+        else:
+            expanded.add(s)  # 兜底：直接当作具体 platform 值
+    return expanded
+
+
+def _merge_feishu_docs(old_docs: list | None, new_docs: list) -> list:
+    """合并新旧 feishu_docs：按 group 去重，新的覆盖旧的，保证不同端互不覆盖"""
+    old_docs = old_docs or []
+    merged = {}
+    for d in old_docs:
+        g = d.get('group') or d.get('platform') or 'unknown'
+        merged[g] = d
+    for d in new_docs:
+        g = d.get('group') or d.get('platform') or 'unknown'
+        merged[g] = d  # 同 group 新覆盖旧
+    return list(merged.values())
+
 # ---- YAPI 接口详情拉取 ----
 YAPI_INTERFACE_API = 'https://ugcqams.snowballfinance.com/internal/getInterfaceData'
 _YAPI_ID_RE = re.compile(r'/interface/api/(\d+)')
@@ -601,6 +643,20 @@ def _run_generate_in_background(task_id: str, payload: dict):
         dist_str = ' · '.join(f"{k}({v})" for k, v in platform_dist.items())
         _progress_log(f"✓ 分批完成：共 {len(flattened_batches)} 批，分布: {dist_str}")
 
+        # ========== 根据用户选择过滤平台 ==========
+        selected_platforms = _expand_platforms(payload.get('selected_platforms'))
+        if selected_platforms:
+            before_count = len(flattened_batches)
+            flattened_batches = [b for b in flattened_batches
+                                 if b.get('platform', '') in selected_platforms]
+            _progress_log(f"🎯 平台过滤：只生成 {selected_platforms}，保留 {len(flattened_batches)}/{before_count} 批")
+            if not flattened_batches:
+                _progress_log("✗ 过滤后无剩余批次，请检查选择的平台是否正确")
+                task['status'] = 'failed'
+                task['error'] = f'过滤后无剩余批次，请检查选择的平台'
+                task['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                return
+
         total = len(flattened_batches)
         with _generation_tasks_lock:
             task['total'] = total
@@ -709,12 +765,12 @@ def _run_generate_in_background(task_id: str, payload: dict):
                         hist_items = json.load(f)
                     for hi in hist_items:
                         if hi.get('task_id') == task_id_in:
-                            hi['testcase_feishu_docs'] = feishu_docs
-                            hi['testcase_total'] = total_cases
+                            hi['testcase_feishu_docs'] = _merge_feishu_docs(hi.get('testcase_feishu_docs'), feishu_docs)
+                            hi['testcase_total'] = sum(d.get('case_count', 0) for d in hi['testcase_feishu_docs'])
                             break
                     with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
                         json.dump(hist_items, f, ensure_ascii=False, indent=2)
-                _progress_log(f"✓ 测试用例飞书文档已写回 history")
+                _progress_log(f"✓ 测试用例飞书文档已写回 history（合并 {len(feishu_docs)} 个端）")
             except Exception as e:
                 logger.warning(f"写回 testcase_feishu_docs 到 history 失败: {e}")
 
@@ -727,6 +783,356 @@ def _run_generate_in_background(task_id: str, payload: dict):
             task['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
+# ============ 全流程 Pipeline ============
+
+def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
+    """一键全流程后台线程：飞书URL → 需求分析 → 测试点 → 测试用例"""
+    _set_thread_task_id(pipeline_task_id)
+    with _pipeline_tasks_lock:
+        pt = _pipeline_tasks.setdefault(pipeline_task_id, {
+            'status': 'running', 'step': 0, 'step_total': 3,
+            'progress': 0, 'total': 0,
+            'result': None, 'error': None,
+            'created_at': payload.get('_created_at', ''),
+            'started_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'finished_at': None, 'logs': [],
+        })
+        pt['status'] = 'running'
+        pt['started_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _plog(text: str):
+        logger.info(text)
+        with _pipeline_tasks_lock:
+            pt['logs'].append({'ts': datetime.now().strftime('%H:%M:%S'), 'text': text})
+
+    doc_url = payload.get('doc_url', '')
+    selected_platforms = _expand_platforms(payload.get('selected_platforms'))
+
+    # ============ Step 1: 需求分析 ============
+    try:
+        _plog("🚀 [Pipeline] 启动全流程，飞书URL: " + doc_url[:80])
+        _plog("========== Step 1/3: 需求分析 ==========")
+        with _agent_lock:
+            req_result = req_agent.process_query(doc_url, feishu_url=doc_url)
+
+        req_title = ''
+        meta = req_result.get('metadata') or {}
+        final_title = (meta.get('title') or req_result.get('feishu_title', '') or '').strip()
+        if final_title.endswith('-需求分析'):
+            req_title = final_title.replace('-需求分析', '')
+        if not req_title:
+            req_title = doc_url.split('/')[-1].split('?')[0][:30]
+
+        task_id = f"REQ-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        _append_history({
+            'task_id': task_id,
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'source_doc_url': doc_url,
+            'source_title': req_title,
+            'feishu_url': req_result.get('feishu_url'),
+            'local_path': req_result.get('local_path'),
+            'yapi_urls': meta.get('yapi_urls', []),
+        })
+
+        _plog(f"✓ Step 1 完成: task_id={task_id}, title={req_title}, 需求分析飞书={req_result.get('feishu_url')}")
+        with _pipeline_tasks_lock:
+            pt['step'] = 1
+            pt['task_id'] = task_id
+            pt['req_result'] = {
+                'task_id': task_id,
+                'title': req_title,
+                'feishu_url': req_result.get('feishu_url'),
+                'local_path': req_result.get('local_path'),
+            }
+    except Exception as e:
+        _plog(f"✗ Step 1 需求分析失败: {type(e).__name__}: {str(e)[:200]}")
+        with _pipeline_tasks_lock:
+            pt['status'] = 'failed'
+            pt['error'] = f'Step1需求分析失败: {str(e)[:300]}'
+            pt['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return
+
+    # ============ Step 2: 测试点生成 ============
+    try:
+        _plog("========== Step 2/3: 测试点生成 ==========")
+        req_md_path = req_result.get('local_path', '')
+        req_md_text = ''
+        if req_md_path and os.path.exists(req_md_path):
+            with open(req_md_path, 'r', encoding='utf-8') as f:
+                req_md_text = f.read()
+        yapi_urls = meta.get('yapi_urls', [])
+        yapi_interfaces = _fetch_yapi_interfaces(yapi_urls)
+
+        with _agent_lock:
+            tp_result = point_agent.execute({
+                'requirements': [{'function': 'all', 'name': req_title, 'complexity': 'medium',
+                                  'test_points': ['功能逻辑'], 'description': req_md_text[:6000]}],
+                'test_type': 'web', 'source': 'prd',
+                'raw_prd': req_md_text, 'title': req_title,
+                'source_doc_url': doc_url,
+                'analysis_doc_url': req_result.get('feishu_url', ''),
+                'yapi_interfaces': yapi_interfaces,
+            })
+
+        json_path = tp_result.get('json_path') or tp_result.get('test_points_json_path', '')
+        tp_feishu_url = tp_result.get('feishu_url', '')
+        batches = tp_result.get('batches', [])
+
+        # 写回 history
+        if json_path:
+            try:
+                with _history_lock:
+                    with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                        hist_items = json.load(f)
+                    for hi in hist_items:
+                        if hi.get('task_id') == task_id:
+                            hi['testpoints_json'] = json_path
+                            if tp_feishu_url:
+                                hi['testpoint_feishu_url'] = tp_feishu_url
+                            break
+                    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(hist_items, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"pipeline写回testpoint失败: {e}")
+
+        total_tp = tp_result.get('total', sum(len(b.get('test_points', [])) for b in batches))
+        _plog(f"✓ Step 2 完成: {len(batches)}批, 共{total_tp}测试点, 测试点飞书={tp_feishu_url}")
+        with _pipeline_tasks_lock:
+            pt['step'] = 2
+            pt['testpoint_result'] = {
+                'total': total_tp, 'batches': len(batches),
+                'feishu_url': tp_feishu_url, 'json_path': json_path,
+            }
+    except Exception as e:
+        _plog(f"✗ Step 2 测试点生成失败: {type(e).__name__}: {str(e)[:200]}")
+        with _pipeline_tasks_lock:
+            pt['status'] = 'failed'
+            pt['error'] = f'Step2测试点生成失败: {str(e)[:300]}'
+            pt['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return
+
+    # ============ Step 3: 测试用例生成 ============
+    try:
+        _plog("========== Step 3/3: 测试用例生成 ==========")
+
+        # 从 json_path 加载 batches（和 _run_generate_in_background 一样的逻辑）
+        tp_json_path = json_path
+        tp_batches = batches
+        if tp_json_path and os.path.exists(tp_json_path):
+            with open(tp_json_path, 'r', encoding='utf-8') as f:
+                tp_data = json.load(f)
+                tp_batches = tp_data.get('batches', tp_batches)
+
+        # 大批次拆小
+        _SPLIT_THRESHOLD = {}
+        flattened_batches = []
+        for batch in tp_batches:
+            platform = batch.get('platform', 'common')
+            pts = batch.get('test_points', [])
+            threshold = _SPLIT_THRESHOLD.get(platform)
+            if threshold and len(pts) > threshold:
+                for sub_idx in range(0, len(pts), threshold):
+                    sub_batch = dict(batch)
+                    sub_batch['test_points'] = pts[sub_idx:sub_idx + threshold]
+                    orig_bi = batch.get('batch_index', 1)
+                    sub_batch['batch_index'] = f"{orig_bi}.{sub_idx // threshold + 1}"
+                    flattened_batches.append(sub_batch)
+            else:
+                flattened_batches.append(batch)
+
+        # 按用户选择过滤平台
+        if selected_platforms:
+            before = len(flattened_batches)
+            flattened_batches = [b for b in flattened_batches
+                                 if b.get('platform', '') in selected_platforms]
+            _plog(f"🎯 平台过滤: 只生成 {selected_platforms}, 保留 {len(flattened_batches)}/{before} 批")
+            if not flattened_batches:
+                _plog("✗ 过滤后无剩余批次")
+                with _pipeline_tasks_lock:
+                    pt['status'] = 'failed'
+                    pt['error'] = '过滤后无剩余批次'
+                    pt['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                return
+
+        total_batches = len(flattened_batches)
+        _plog(f"共 {total_batches} 批待生成测试用例")
+        with _pipeline_tasks_lock:
+            pt['total'] = total_batches
+
+        # 逐批生成
+        all_results = []
+        for i, batch in enumerate(flattened_batches):
+            platform_label = batch.get('platform_label', '')
+            platform = batch.get('platform', '')
+            batch_idx = batch.get('batch_index', 1)
+            pts_count = len(batch.get('test_points', []))
+            _plog(f"--- [{i+1}/{total_batches}] {platform_label} batch#{batch_idx} ({pts_count}测试点) ---")
+
+            try:
+                sc = batch.get('shared_context') or {}
+                sc['requirement_context'] = req_md_text[:8000]
+                batch['shared_context'] = sc
+                with _agent_lock:
+                    result = gen_agent.execute_batch(batch)
+                all_results.append(result)
+                case_count = len(result.get('test_cases', []))
+                _plog(f"  ✓ {platform_label} → {case_count} 条用例")
+            except Exception as e:
+                logger.error(f"pipeline batch失败 [{platform}-{batch_idx}]: {e}")
+                _plog(f"  ✗ {platform_label} batch#{batch_idx} 失败: {type(e).__name__}")
+
+            with _pipeline_tasks_lock:
+                pt['progress'] = i + 1
+
+        total_cases = sum(len(r.get('test_cases', [])) for r in all_results)
+        _plog(f"✓ JSON用例生成完毕：共 {total_cases} 条")
+
+        # 按端分组 → 飞书文档
+        from agents.test_generator.agent import _PLATFORM_FOLDER_MAP, _PLATFORM_GROUP_LABEL
+        by_group: dict[str, list] = {}
+        group_platforms: dict[str, str] = {}
+        for r in all_results:
+            p = r.get('platform', 'common')
+            gl = _PLATFORM_GROUP_LABEL.get(p, '其他')
+            by_group.setdefault(gl, []).extend(r.get('test_cases', []))
+            group_platforms.setdefault(gl, p)
+
+        feishu_docs = []
+        if feishu_client:
+            for gl, cases in by_group.items():
+                if not cases:
+                    continue
+                platform = group_platforms[gl]
+                folder_token = _PLATFORM_FOLDER_MAP.get(platform)
+                if not folder_token:
+                    _plog(f"⚠ {gl} 无飞书文件夹配置，跳过")
+                    continue
+                struct_nodes = []
+                struct_nodes.append({'type': 'paragraph', 'text': f'需求文档链接：[点击查看]({doc_url})'})
+                struct_nodes.append({'type': 'paragraph', 'text': f'需求分析：[点击查看]({req_result.get("feishu_url", "")})'})
+                if tp_feishu_url:
+                    struct_nodes.append({'type': 'paragraph', 'text': f'测试点分析：[点击查看]({tp_feishu_url})'})
+                struct_nodes.extend(gen_agent.cases_to_feishu_struct(cases, gl))
+                safe_title = req_title.replace('|', '-').strip()
+                _plog(f"  创建飞书文档：【{safe_title}】{gl}测试用例（{len(cases)}条）")
+                try:
+                    doc_result = feishu_client.create_doc_from_struct(
+                        title=f"【{safe_title}】{gl}测试用例",
+                        folder_token=folder_token,
+                        struct_blocks=struct_nodes
+                    )
+                    feishu_docs.append({'group': gl, 'platform': platform,
+                                        'feishu_url': doc_result['url'], 'case_count': len(cases)})
+                    _plog(f"  ✓ {gl} 飞书文档: {doc_result['url']}")
+                except Exception as e:
+                    logger.error(f"[{gl}] 飞书文档创建失败: {e}")
+                    _plog(f"  ✗ {gl} 飞书文档创建失败: {type(e).__name__}")
+
+        _plog(f"========== Pipeline 全部完成：{total_cases}条用例，{len(feishu_docs)}个飞书文档 ==========")
+
+        # 写回 history
+        if feishu_docs and task_id:
+            try:
+                with _history_lock:
+                    with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                        hist_items = json.load(f)
+                    for hi in hist_items:
+                        if hi.get('task_id') == task_id:
+                            hi['testcase_feishu_docs'] = _merge_feishu_docs(hi.get('testcase_feishu_docs'), feishu_docs)
+                            hi['testcase_total'] = sum(d.get('case_count', 0) for d in hi['testcase_feishu_docs'])
+                            break
+                    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(hist_items, f, ensure_ascii=False, indent=2)
+                _plog(f"✓ Pipeline 结果已写回 history（合并 {len(feishu_docs)} 个端，共 {sum(d.get('case_count',0) for d in feishu_docs)} 条）")
+            except Exception as e:
+                logger.warning(f"pipeline写回history失败: {e}")
+
+        with _pipeline_tasks_lock:
+            pt['status'] = 'completed'
+            pt['step'] = 3
+            pt['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            pt['result'] = {
+                'task_id': task_id,
+                'req_feishu_url': req_result.get('feishu_url'),
+                'testpoint_feishu_url': tp_feishu_url,
+                'testpoint_total': total_tp,
+                'total_cases': total_cases,
+                'feishu_docs': feishu_docs,
+            }
+
+    except Exception as e:
+        logger.error(f"pipeline Step3异常: {e}")
+        _plog(f"✗ Step 3 异常: {type(e).__name__}: {str(e)[:200]}")
+        with _pipeline_tasks_lock:
+            pt['status'] = 'failed'
+            pt['error'] = f'Step3测试用例生成失败: {str(e)[:300]}'
+            pt['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+@app.route('/api/pipeline_async', methods=['POST'])
+def pipeline_async():
+    """一键全流程：飞书URL → 需求分析 → 测试点 → 测试用例，异步立即返回"""
+    data = request.json or {}
+    doc_url = data.get('doc_url', '').strip()
+    if not doc_url:
+        return jsonify({'error': '缺少 doc_url'}), 400
+
+    # 简单校验是否是飞书链接
+    if not re.match(r'^https?://', doc_url):
+        return jsonify({'error': 'doc_url 不合法，需要 http(s):// 开头'}), 400
+
+    selected_platforms = data.get('selected_platforms') or None
+
+    pipeline_task_id = f"PIPE-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    with _pipeline_tasks_lock:
+        _pipeline_tasks[pipeline_task_id] = {
+            'status': 'queued', 'step': 0, 'step_total': 3,
+            'progress': 0, 'total': 0,
+            'result': None, 'error': None,
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'started_at': None, 'finished_at': None, 'logs': [],
+        }
+
+    payload = {
+        'doc_url': doc_url,
+        'selected_platforms': selected_platforms,
+        '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    t = threading.Thread(target=_run_pipeline_in_background, args=(pipeline_task_id, payload), daemon=True)
+    t.start()
+
+    return jsonify({'success': True, 'pipeline_task_id': pipeline_task_id, 'status': 'queued'})
+
+
+@app.route('/api/pipeline_status', methods=['GET'])
+def pipeline_status():
+    """轮询 pipeline 任务状态"""
+    pipeline_task_id = request.args.get('pipeline_task_id', '').strip()
+    if not pipeline_task_id:
+        return jsonify({'error': '缺少 pipeline_task_id'}), 400
+    with _pipeline_tasks_lock:
+        pt = _pipeline_tasks.get(pipeline_task_id)
+    if not pt:
+        return jsonify({'error': '任务不存在'}), 404
+    # 返回快照（避免锁外修改）
+    snapshot = {
+        'status': pt['status'],
+        'step': pt['step'],
+        'step_total': pt['step_total'],
+        'progress': pt['progress'],
+        'total': pt['total'],
+        'task_id': pt.get('task_id', ''),
+        'req_result': pt.get('req_result'),
+        'testpoint_result': pt.get('testpoint_result'),
+        'result': pt.get('result'),
+        'error': pt.get('error'),
+        'started_at': pt.get('started_at'),
+        'finished_at': pt.get('finished_at'),
+        'logs': pt.get('logs', [])[-50:],  # 最近50条
+    }
+    return jsonify(snapshot)
+
+
 @app.route('/api/generate_async', methods=['POST'])
 def generate_test_async():
     """异步测试生成接口：立即返回 task_id，后台线程执行"""
@@ -734,6 +1140,8 @@ def generate_test_async():
     task_id_in = data.get('task_id', '')
     if not task_id_in:
         return jsonify({'error': '缺少 task_id'}), 400
+
+    selected_platforms = data.get('selected_platforms') or None  # 可选：如 ['client_common', 'backend']
 
     new_task_id = f"GEN-{task_id_in}-{datetime.now().strftime('%H%M%S')}"
     with _generation_tasks_lock:
@@ -744,11 +1152,56 @@ def generate_test_async():
             'started_at': None, 'finished_at': None, 'logs': [],
         }
 
-    payload = {'task_id': task_id_in, '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    payload = {
+        'task_id': task_id_in,
+        'selected_platforms': selected_platforms,
+        '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
     t = threading.Thread(target=_run_generate_in_background, args=(new_task_id, payload), daemon=True)
     t.start()
 
     return jsonify({'success': True, 'gen_task_id': new_task_id, 'status': 'queued'})
+
+
+@app.route('/api/testpoint_platforms', methods=['GET'])
+def get_testpoint_platforms():
+    """查询 task_id 涉及哪些端（用于前端勾选要生成哪部分测试用例）"""
+    task_id = request.args.get('task_id', '').strip()
+    if not task_id:
+        return jsonify({'error': '缺少 task_id'}), 400
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            items = json.load(f)
+        tp_json_path = None
+        for it in items:
+            if it.get('task_id') == task_id:
+                tp_json_path = it.get('testpoints_json')
+                break
+        if not tp_json_path or not os.path.exists(tp_json_path):
+            return jsonify({'error': f'任务 {task_id} 未找到测试点JSON'}), 404
+        with open(tp_json_path, 'r', encoding='utf-8') as f:
+            tp_data = json.load(f)
+        batches = tp_data.get('batches', [])
+        # 统计各端（按 _PLATFORM_GROUP_LABEL 归并）
+        from agents.test_generator.agent import _PLATFORM_GROUP_LABEL
+        platforms = {}  # group_label -> {platform, count}
+        for b in batches:
+            platform = b.get('platform', '')
+            group = _PLATFORM_GROUP_LABEL.get(platform, '其他')
+            count = len(b.get('test_points', []))
+            if group not in platforms:
+                platforms[group] = {'platform': platform, 'count': 0}
+            platforms[group]['count'] += count
+        result = []
+        for group, info in platforms.items():
+            result.append({
+                'group': group,
+                'platform': info['platform'],
+                'count': info['count'],
+            })
+        return jsonify({'success': True, 'platforms': result, 'total': tp_data.get('total', 0)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/generate_status', methods=['GET'])
@@ -1045,6 +1498,49 @@ def get_history():
     except Exception as e:
         logger.warning(f"读取历史记录失败: {e}")
         return jsonify({'items': [], 'total': 0})
+
+
+@app.route('/api/history', methods=['DELETE'])
+def delete_history_item():
+    """删除一条历史记录（按 task_id）。同时尝试清理关联的本地文件（md/json）"""
+    data = request.json or {}
+    task_id = data.get('task_id', '').strip()
+    if not task_id:
+        return jsonify({'error': '缺少 task_id'}), 400
+
+    with _history_lock:
+        if not os.path.exists(HISTORY_FILE):
+            return jsonify({'error': 'history 文件不存在'}), 404
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            items = json.load(f)
+
+        removed = None
+        remaining = []
+        for it in items:
+            if it.get('task_id') == task_id:
+                removed = it
+            else:
+                remaining.append(it)
+
+        if not removed:
+            return jsonify({'error': f'task_id={task_id} 不存在'}), 404
+
+        # 清理本地文件（可选）
+        cleaned_files = []
+        for key in ('local_path', 'testpoints_json'):
+            fp = removed.get(key, '')
+            if fp and os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                    cleaned_files.append(fp)
+                except Exception as e:
+                    logger.warning(f"删除文件 {fp} 失败: {e}")
+
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(remaining, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"✓ 已删除 history: task_id={task_id}, 清理文件={len(cleaned_files)}个")
+    return jsonify({'success': True, 'removed_task_id': task_id, 'cleaned_files': cleaned_files})
 
 
 @app.route('/api/logs')
