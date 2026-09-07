@@ -131,7 +131,7 @@ class LLMClient:
         base_url = self.base_url or os.getenv('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
         _to = timeout or 120
         http_client = httpx.Client(trust_env=False, timeout=_to)
-        client = OpenAI(api_key=self.api_key, base_url=base_url, http_client=http_client)
+        client = OpenAI(api_key=self.api_key, base_url=base_url, http_client=http_client, max_retries=0)
 
         messages = []
         if system_prompt:
