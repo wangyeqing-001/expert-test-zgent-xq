@@ -34,18 +34,24 @@ def _repair_struct_json(s: str) -> str:
 
     修复范围（只做确定安全的，不误伤值内容）：
     1. trailing comma：, ] 或 , }
-    2. 字符串值内部的裸双引号（如 "核心痛点："人工运营成本高"" 中的 "人工运营成本高"）
+    2. 字符串值内部的裸双引号 → 替换成中文「」（既不破坏 JSON，又保留引号语义）
+
+    判定逻辑：
+    - 值后面紧跟 `:` → 是 JSON key 正常结束
+    - 值后面紧跟 `,` `]` `}` → 是 value 正常结束
+    - 否则 → 值内部忘了转义的裸双引号，替换成「」
     """
     if not s:
         return s
     # 1. trailing comma
     s = re.sub(r',\s*([}\]])', r'\1', s)
 
-    # 2. 裸双引号修复（状态机：只在 JSON 字符串值内遇到非转义 " 时转义）
+    # 2. 裸双引号修复
     out = []
     in_string = False
     i = 0
-    while i < len(s):
+    n = len(s)
+    while i < n:
         c = s[i]
         if not in_string:
             out.append(c)
@@ -56,17 +62,30 @@ def _repair_struct_json(s: str) -> str:
                 # 转义序列原样保留
                 out.append(c)
                 i += 1
-                if i < len(s):
+                if i < n:
                     out.append(s[i])
             elif c == '"':
-                # 字符串结束
-                out.append(c)
-                in_string = False
+                # 跳过空白后看首个非空白字符
+                j = i + 1
+                while j < n and s[j] in ' \t\n\r':
+                    j += 1
+                next_non_ws = s[j] if j < n else ''
+                if next_non_ws == ':':
+                    # JSON key 正常结束
+                    out.append(c)
+                    in_string = False
+                elif next_non_ws in ',}]':
+                    # value 正常结束
+                    out.append(c)
+                    in_string = False
+                else:
+                    # 值内部忘了转义的裸双引号 → 替换成「/」
+                    last = '「' if (not out or out[-1] != '」') else '」'
+                    out.append(last)
             else:
                 out.append(c)
         i += 1
-    s = ''.join(out)
-    return s
+    return ''.join(out)
 
 
 def parse_struct_json(text: str) -> list:
