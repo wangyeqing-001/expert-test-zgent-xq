@@ -29,11 +29,51 @@ def _strip_fences(text: str) -> str:
     return t.strip()
 
 
+def _repair_struct_json(s: str) -> str:
+    """修复 LLM 输出 structured JSON 的常见脏格式
+
+    修复范围（只做确定安全的，不误伤值内容）：
+    1. trailing comma：, ] 或 , }
+    2. 字符串值内部的裸双引号（如 "核心痛点："人工运营成本高"" 中的 "人工运营成本高"）
+    """
+    if not s:
+        return s
+    # 1. trailing comma
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+
+    # 2. 裸双引号修复（状态机：只在 JSON 字符串值内遇到非转义 " 时转义）
+    out = []
+    in_string = False
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if not in_string:
+            out.append(c)
+            if c == '"':
+                in_string = True
+        else:
+            if c == '\\':
+                # 转义序列原样保留
+                out.append(c)
+                i += 1
+                if i < len(s):
+                    out.append(s[i])
+            elif c == '"':
+                # 字符串结束
+                out.append(c)
+                in_string = False
+            else:
+                out.append(c)
+        i += 1
+    s = ''.join(out)
+    return s
+
+
 def parse_struct_json(text: str) -> list:
     """解析LLM输出的业务JSON为节点列表；解析/校验失败返回None
     
     容错策略（防御脏JSON）：
-    1. 去代码块标记后json.loads；失败则截取首个[到末尾]重试
+    1. 去代码块标记后json.loads → 失败则 repair + 截取 [..] 重试
     2. 过滤未知类型节点（告警不中断）
     3. table行列不对齐时自动补齐/截断（告警不中断）
     """
@@ -42,17 +82,22 @@ def parse_struct_json(text: str) -> list:
     try:
         data = json.loads(t)
     except json.JSONDecodeError:
-        # 容错：截取JSON数组区间重试（LLM前后可能带解释文字）
-        start, end = t.find('['), t.rfind(']')
-        if start >= 0 and end > start:
-            try:
-                data = json.loads(t[start:end + 1])
-            except json.JSONDecodeError as e:
-                logger.error(f"业务JSON解析失败: {e}, raw={t[:200]}")
+        # 容错1：repair（trailing comma + 裸双引号）
+        repaired = _repair_struct_json(t)
+        try:
+            data = json.loads(repaired)
+        except json.JSONDecodeError:
+            # 容错2：截取JSON数组区间重试
+            start, end = repaired.find('['), repaired.rfind(']')
+            if start >= 0 and end > start:
+                try:
+                    data = json.loads(repaired[start:end + 1])
+                except json.JSONDecodeError as e:
+                    logger.error(f"业务JSON解析失败: {e}, raw={t[:200]}")
+                    return None
+            else:
+                logger.error(f"业务JSON格式异常(无数组结构): {t[:200]}")
                 return None
-        else:
-            logger.error(f"业务JSON格式异常(无数组结构): {t[:200]}")
-            return None
 
     if not isinstance(data, list) or not data:
         logger.error(f"业务JSON顶层必须是非空数组, got={type(data).__name__}")
