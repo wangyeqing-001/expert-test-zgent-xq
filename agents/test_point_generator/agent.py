@@ -404,6 +404,12 @@ class TestPointGenerator(BaseAgent):
             response = self.llm.generate(prompt, max_tokens=12000)
             logger.info(f"  ◀ [LLM返回] 测试点-主提取 耗时{time.time()-t0:.1f}s，输出{len(response or '')}字符")
 
+            # 调试：落盘 LLM 原始输出，便于排查 JSON 解析失败
+            _debug_path = os.path.join(self.output_dir, f'_debug_llm_raw_{datetime.now().strftime("%H%M%S")}.txt')
+            with open(_debug_path, 'w', encoding='utf-8') as _f:
+                _f.write(response or '')
+            logger.info(f"  [DEBUG] LLM 原始输出已落盘: {_debug_path}")
+
             parsed, interface_index = self._parse_llm_json(response)
             points = []
             if isinstance(parsed, list):
@@ -434,7 +440,8 @@ class TestPointGenerator(BaseAgent):
             # 后验检查：scope 分布
             by_scope: dict[str, int] = {}
             for p in points:
-                by_scope[p] = by_scope.get(p.get('scope', 'unknown'), 0) + 1
+                sc = p.get('scope', 'unknown')
+                by_scope[sc] = by_scope.get(sc, 0) + 1
             print(f"  📊 scope 分布: {by_scope}")
 
             return points, interface_index
