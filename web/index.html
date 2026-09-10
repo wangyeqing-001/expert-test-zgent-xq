@@ -604,22 +604,18 @@
 
     <script>
         // 切换标签页
-        let _historyLoaded = new Set();  // 已加载过历史的 tab 集合
         function switchTab(tab, el) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.content[id$="-panel"]').forEach(p => p.style.display = 'none');
             el.classList.add('active');
             document.getElementById(tab + '-panel').style.display = 'block';
-            // 懒加载该 tab 的历史记录（只加载一次）
+            // 切换 tab 时自动刷新历史记录
             const boxMap = {requirement: 'req-history-content', testpoints: 'tp-history-content', generate: 'gen-history-content'};
             const boxId = boxMap[tab];
-            if (boxId && !_historyLoaded.has(tab)) {
-                _historyLoaded.add(tab);
+            if (boxId) {
                 loadHistory(boxId);
             }
-            // lookup tab 直接加载全部历史
-            if (tab === 'lookup' && !_historyLoaded.has('lookup')) {
-                _historyLoaded.add('lookup');
+            if (tab === 'lookup') {
                 showAllHistory();
             }
         }

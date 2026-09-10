@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import threading
 import logging
 from typing import Any
 from datetime import datetime
@@ -57,31 +58,35 @@ class _CircuitBreaker:
         self.failure_count = 0
         self.last_failure_time = 0.0
         self.state = 'closed'  # closed / open / half_open
+        self._lock = threading.Lock()  # 多任务并行时保护状态转换
 
     def can_execute(self) -> bool:
-        if self.state == 'open':
-            if time.time() - self.last_failure_time > self.reset_timeout:
-                self.state = 'half_open'
-                logger.warning(f"[熔断器] open→half_open，允许一次试探性调用")
-                return True
-            return False  # open 状态，直接拒绝
-        return True  # closed 或 half_open 都允许
+        with self._lock:
+            if self.state == 'open':
+                if time.time() - self.last_failure_time > self.reset_timeout:
+                    self.state = 'half_open'
+                    logger.warning(f"[熔断器] open→half_open，允许一次试探性调用")
+                    return True
+                return False  # open 状态，直接拒绝
+            return True  # closed 或 half_open 都允许
 
     def record_success(self):
-        if self.state in ('open', 'half_open'):
-            logger.warning(f"[熔断器] {self.state}→closed（调用成功）")
-        self.failure_count = 0
-        self.state = 'closed'
+        with self._lock:
+            if self.state in ('open', 'half_open'):
+                logger.warning(f"[熔断器] {self.state}→closed（调用成功）")
+            self.failure_count = 0
+            self.state = 'closed'
 
     def record_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.state == 'half_open':
-            self.state = 'open'
-            logger.warning(f"[熔断器] half_open→open（试探失败，冷却 {self.reset_timeout}s）")
-        elif self.failure_count >= self.failure_threshold:
-            self.state = 'open'
-            logger.warning(f"[熔断器] closed→open（连续失败 {self.failure_count} 次，冷却 {self.reset_timeout}s）")
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.state == 'half_open':
+                self.state = 'open'
+                logger.warning(f"[熔断器] half_open→open（试探失败，冷却 {self.reset_timeout}s）")
+            elif self.failure_count >= self.failure_threshold:
+                self.state = 'open'
+                logger.warning(f"[熔断器] closed→open（连续失败 {self.failure_count} 次，冷却 {self.reset_timeout}s）")
 
 
 class TestGeneratorAgent(BaseAgent):
@@ -399,6 +404,7 @@ class TestGeneratorAgent(BaseAgent):
             test_points_list=test_points_list,
             requirement_context=sc.get('requirement_context', '（无）'),
             yapi_context=sc.get('yapi_context', '（无 YAPI 接口关联信息）'),
+            design_context=sc.get('design_context', '（无设计稿补充信息，仅基于 PRD 文本生成）'),
             past_batches_summary=sc.get('past_batches_summary', '（首轮批次，无前序参考）'))
         test_cases = []
         platform_label = batch.get('platform_label', platform)
@@ -602,30 +608,50 @@ class TestGeneratorAgent(BaseAgent):
     def cases_to_feishu_struct(test_cases: list, platform_label: str = '') -> list:
         """将 JSON 测试用例列表转为飞书 struct_nodes（用于 create_doc_from_struct）
         对齐参考文档格式：H1=模块 → H2=测试点 → 每测试点下一个表格
-        表格列：优先级 | 测试场景 | 测试步骤 | 预期结果 | 执行结果 | 备注
+        表格列：用例ID | 优先级 | 测试场景 | 测试步骤 | 预期结果 | 执行结果 | 备注
+
+        编号规则：
+        - 模块 H1：一、二、三、四...（中文数字）
+        - 测试点 H2：1. 2. 3. ...（阿拉伯数字 + 点）
+        - 用例 ID：TC-001, TC-002, ...（全局递增）
         """
         if not test_cases:
             return [{'type': 'paragraph', 'text': '（本批次无测试用例）'}]
 
-        # 按 test_module → test_point 两级分组
+        # 按 test_module → test_point 两级分组，保持原始顺序
         by_module: dict[str, dict[str, list]] = {}
+        module_order: list[str] = []
         for tc in test_cases:
             mod = tc.get('test_module', '未分类')
             point = tc.get('test_point', tc.get('test_scenario', ''))
-            by_module.setdefault(mod, {}).setdefault(point, []).append(tc)
+            if mod not in by_module:
+                by_module[mod] = {}
+                module_order.append(mod)
+            by_module[mod].setdefault(point, []).append(tc)
+
+        # 中文数字映射
+        _CN_NUM = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十',
+                   '十一', '十二', '十三', '十四', '十五', '十六', '十七', '十八', '十九', '二十']
 
         struct_nodes = []
-        HEADERS = ['优先级', '测试场景', '测试步骤', '预期结果', '执行结果', '备注']
+        HEADERS = ['用例ID', '优先级', '测试场景', '测试步骤', '预期结果', '执行结果', '备注']
 
-        for mod, points in by_module.items():
-            struct_nodes.append({'type': 'h1', 'text': mod})
-            for point, cases in points.items():
-                struct_nodes.append({'type': 'h2', 'text': point})
+        case_counter = 0  # 全局用例 ID 计数器
+
+        for mod_idx, mod in enumerate(module_order):
+            points = by_module[mod]
+            mod_label = _CN_NUM[mod_idx] if mod_idx < len(_CN_NUM) else str(mod_idx + 1)
+            struct_nodes.append({'type': 'h1', 'text': f'{mod_label}、{mod}'})
+
+            for point_idx, (point, cases) in enumerate(points.items()):
+                struct_nodes.append({'type': 'h2', 'text': f'{point_idx + 1}. {point}'})
                 rows = []
                 for tc in cases:
+                    case_counter += 1
                     steps = '\n'.join(tc.get('test_steps', []))
                     expected = '\n'.join(tc.get('expected_results', []))
                     rows.append([
+                        f'TC-{case_counter:03d}',
                         tc.get('priority', ''),
                         tc.get('test_scenario', ''),
                         steps,
