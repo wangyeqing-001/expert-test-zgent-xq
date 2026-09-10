@@ -79,6 +79,7 @@ class TestPointGenerator(BaseAgent):
         source_doc_url = input_data.get('source_doc_url', '')
         analysis_doc_url = input_data.get('analysis_doc_url', '')
         yapi_interfaces = input_data.get('yapi_interfaces', [])
+        design_context = input_data.get('design_context', '')
         
         # 根据来源选择链路
         json_path = None
@@ -92,7 +93,8 @@ class TestPointGenerator(BaseAgent):
             # structured_constraints: None=自动跑分支A提取；显式传入则直接使用
             structured_constraints = input_data.get('structured_constraints')
             test_points, interface_index = self._extract_testpoints_from_prd(prd_text, structured_constraints,
-                                                               yapi_interfaces=yapi_interfaces)
+                                                               yapi_interfaces=yapi_interfaces,
+                                                               design_context=design_context)
             batches = []
             if test_points:
                 local_path, feishu_url, json_path, batches = self._publish_points(
@@ -317,7 +319,8 @@ class TestPointGenerator(BaseAgent):
             return ''
     
     def _extract_testpoints_from_prd(self, prd_text: str, structured_constraints: str = None,
-                                       yapi_interfaces: list = None):
+                                       yapi_interfaces: list = None,
+                                       design_context: str = ''):
         """按prd_to_testpoints.md直提测试点：
         - 新路径：AI 输出 {test_points, interface_index} 对象
         - 老路径（fallback）：扁平数组 or 端分组 dict
@@ -398,7 +401,8 @@ class TestPointGenerator(BaseAgent):
             prompt = build_prompt(_DIR, 'prd_to_testpoints.md',
                 prd_requirements=prd_text[:30000],
                 structured_constraints=(structured_constraints or '（无辅助材料）')[-6000:],
-                yapi_interfaces=yapi_text[:12000])
+                yapi_interfaces=yapi_text[:12000],
+                design_context=design_context or '（无设计稿信息）')
             logger.info(f"  ▶ [LLM调用] 测试点-主提取 (prompt约{len(prompt)}字符, max_tokens=12000)")
             t0 = time.time()
             response = self.llm.generate(prompt, max_tokens=12000)

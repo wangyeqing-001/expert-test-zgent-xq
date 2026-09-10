@@ -34,19 +34,23 @@ def _repair_struct_json(s: str) -> str:
 
     修复范围（只做确定安全的，不误伤值内容）：
     1. trailing comma：, ] 或 , }
-    2. 字符串值内部的裸双引号 → 替换成中文「」（既不破坏 JSON，又保留引号语义）
+    2. JSON 字符串内部的字面控制字符（换行 / 回车 / tab）→ 转义为 \\n / \\t
+    3. 字符串值内部的裸双引号 → 替换成中文「」（既不破坏 JSON，又保留引号语义）
 
-    判定逻辑：
-    - 值后面紧跟 `:` → 是 JSON key 正常结束
-    - 值后面紧跟 `,` `]` `}` → 是 value 正常结束
-    - 否则 → 值内部忘了转义的裸双引号，替换成「」
+    判定逻辑（逐字符扫描，追踪 JSON string 边界）：
+    - 不在 string 内 → 原样输出，遇到 " 进入 string
+    - 在 string 内：
+      - \\ 开头的转义序列 → 原样输出
+      - 字面 \\n \\r \\t → 转义为 \\n \\t（JSON 合法的字符串内容）
+      - " → 看后续是否为 `:` / `,}` / `]`，是则为 string 结束；否则为裸引号 → 「」
+      - 其他 → 原样输出
     """
     if not s:
         return s
     # 1. trailing comma
     s = re.sub(r',\s*([}\]])', r'\1', s)
 
-    # 2. 裸双引号修复
+    # 2. 裸双引号修复 + 字符串内控制字符转义（单遍扫描）
     out = []
     in_string = False
     i = 0
@@ -59,11 +63,19 @@ def _repair_struct_json(s: str) -> str:
                 in_string = True
         else:
             if c == '\\':
-                # 转义序列原样保留
+                # 转义序列原样保留（下一字符也保留）
                 out.append(c)
                 i += 1
                 if i < n:
                     out.append(s[i])
+            elif c in ('\n', '\r', '\t'):
+                # ⭐ JSON string 内的字面控制字符 → 转义
+                if c == '\n':
+                    out.append('\\n')
+                elif c == '\r':
+                    out.append('\\r')
+                elif c == '\t':
+                    out.append('\\t')
             elif c == '"':
                 # 跳过空白后看首个非空白字符
                 j = i + 1
@@ -82,10 +94,36 @@ def _repair_struct_json(s: str) -> str:
                     # 值内部忘了转义的裸双引号 → 替换成「/」
                     last = '「' if (not out or out[-1] != '」') else '」'
                     out.append(last)
+            elif ord(c) < 32:
+                # 其他罕见控制字符（\x00-\x1f）→ 直接跳过
+                pass
             else:
                 out.append(c)
         i += 1
     return ''.join(out)
+
+
+def _save_debug_raw(raw_text: str, error) -> None:
+    """JSON 解析失败时保存原始 LLM 输出到 debug 文件，便于排查"""
+    import time as _time, os
+    ts = _time.strftime('%H%M%S')
+    try:
+        # 优先存到 generated_testpoints/ 目录
+        from agents.test_point_generator.agent import _OUTPUT_DIR
+        d = _OUTPUT_DIR
+    except Exception:
+        d = os.getcwd()
+    path = os.path.join(d, f'_debug_struct_json_{ts}.txt')
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(f'# 错误: {error}\n')
+            f.write(f'# 长度: {len(raw_text)} 字符\n')
+            f.write(f'# 时间: {_time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+            f.write('--- LLM 原始输出 ---\n')
+            f.write(raw_text)
+        logger.warning(f"💾 已保存解析失败的原始输出 → {path}")
+    except Exception:
+        pass
 
 
 def parse_struct_json(text: str) -> list:
@@ -101,7 +139,7 @@ def parse_struct_json(text: str) -> list:
     try:
         data = json.loads(t)
     except json.JSONDecodeError:
-        # 容错1：repair（trailing comma + 裸双引号）
+        # 容错1：repair（trailing comma + 控制字符转义 + 裸双引号）
         repaired = _repair_struct_json(t)
         try:
             data = json.loads(repaired)
@@ -112,10 +150,13 @@ def parse_struct_json(text: str) -> list:
                 try:
                     data = json.loads(repaired[start:end + 1])
                 except json.JSONDecodeError as e:
-                    logger.error(f"业务JSON解析失败: {e}, raw={t[:200]}")
+                    # 保存完整原始输出用于 debug
+                    _save_debug_raw(t, e)
+                    logger.error(f"业务JSON解析失败(截取后): {e}")
                     return None
             else:
-                logger.error(f"业务JSON格式异常(无数组结构): {t[:200]}")
+                _save_debug_raw(t, '无数组结构')
+                logger.error(f"业务JSON格式异常(无数组结构)")
                 return None
 
     if not isinstance(data, list) or not data:

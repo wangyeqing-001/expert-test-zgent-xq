@@ -16,14 +16,59 @@ from agents.requirement_analyzer import RequirementAnalyzer
 from agents.test_point_generator import TestPointGenerator
 from agents.test_generator import TestGeneratorAgent
 from core.feishu_client import FeishuClient
+from core.design_analyzer import analyze_design_sources, extract_figma_urls_from_text
 
-# 配置日志
+# ---- 日志基础设施 ----
+os.makedirs('logs', exist_ok=True)
+_LOGS_DIR = os.path.abspath('logs')
+
+# 基础配置（console + handler 输出）
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger(__name__)
+
+# 按 task_id 分文件的独立写入锁（同一 task 不并发写）
+_task_file_locks: dict[str, threading.Lock] = {}
+_task_file_locks_global = threading.Lock()
+
+
+def _task_log_path(task_id: str) -> str:
+    """task_id → 日志文件绝对路径"""
+    # 路径里不能有 / \ 等特殊字符，安全化一下
+    safe = re.sub(r'[^\w\-]', '_', task_id)
+    return os.path.join(_LOGS_DIR, f'task_{safe}.log')
+
+
+def _get_task_file_lock(task_id: str) -> threading.Lock:
+    with _task_file_locks_global:
+        if task_id not in _task_file_locks:
+            _task_file_locks[task_id] = threading.Lock()
+        return _task_file_locks[task_id]
+
+
+def _append_task_log(task_id: str, formatted_line: str) -> None:
+    """向 task 专属日志文件追加一行。线程安全，失败静默。"""
+    if not task_id:
+        return
+    try:
+        lock = _get_task_file_lock(task_id)
+        with lock:
+            with open(_task_log_path(task_id), 'a', encoding='utf-8') as f:
+                f.write(formatted_line.rstrip('\n') + '\n')
+    except Exception:
+        pass
+
+
+def _append_app_log(formatted_line: str) -> None:
+    """向主日志 logs/app.log 追加一行（供 grep 兜底用）"""
+    try:
+        with open(os.path.join(_LOGS_DIR, 'app.log'), 'a', encoding='utf-8') as f:
+            f.write(formatted_line.rstrip('\n') + '\n')
+    except Exception:
+        pass
 
 
 def clean_control_chars(text: str) -> str:
@@ -55,7 +100,7 @@ def _get_thread_task_id() -> str:
 
 
 class _BufferLogHandler(logging.Handler):
-    """把日志同步写入内存缓冲，前端轮询展示。自动附带线程 task_id 标签。"""
+    """logger 输出 → 内存缓冲（前端轮询）+ task 专属文件 + 主日志"""
     def emit(self, record):
         global _log_seq
         try:
@@ -63,9 +108,13 @@ class _BufferLogHandler(logging.Handler):
             tid = _get_thread_task_id()
             if tid and tid not in text:
                 text = f"[{tid}] {text}"
+            # 1) 内存缓冲
             with _log_lock:
                 _log_seq += 1
                 _log_buffer.append((_log_seq, text))
+            # 2) task 专属文件（有 task_id 才写）
+            if tid:
+                _append_task_log(tid, text)
         except Exception:
             pass
 
@@ -73,7 +122,7 @@ class _BufferLogHandler(logging.Handler):
 _buf_handler = _BufferLogHandler()
 _buf_handler.setLevel(logging.INFO)
 _buf_handler.setFormatter(logging.Formatter(
-    '%(asctime)s [%(name)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S'
+    '%(asctime)s [%(name)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
 ))
 logging.getLogger().addHandler(_buf_handler)
 # 降低 werkzeug 请求日志级别，避免轮询刷屏
@@ -81,24 +130,33 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 
 class _StdoutBridge:
-    """把 print() 输出同时写入 _log_buffer，让前端能看到所有日志。自动附带线程 task_id。"""
+    """print() 输出 → 内存缓冲 + task 专属文件 + 主日志"""
     def __init__(self, original):
         self._orig = original
+
     def write(self, s):
         self._orig.write(s)
-        if s and s.strip():
-            with _log_lock:
-                global _log_seq
-                _log_seq += 1
-                tid = _get_thread_task_id()
-                text = s.rstrip('\n')
-                if tid and tid not in text:
-                    text = f"[{tid}] {text}"
-                _log_buffer.append((_log_seq, text))
+        if not s or not s.strip():
+            return
+        text = s.rstrip('\n')
+        tid = _get_thread_task_id()
+        with _log_lock:
+            global _log_seq
+            _log_seq += 1
+            buffered = f"[{tid}] {text}" if tid and tid not in text else text
+            _log_buffer.append((_log_seq, buffered))
+        # task 专属文件
+        if tid:
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            line = f'{ts} [print] {text}'
+            _append_task_log(tid, line)
+
     def flush(self):
         self._orig.flush()
+
     def __getattr__(self, name):
         return getattr(self._orig, name)
+
 
 sys.stdout = _StdoutBridge(sys.stdout)
 sys.stderr = _StdoutBridge(sys.stderr)
@@ -126,14 +184,18 @@ else:
 feishu_app_id = os.getenv('FEISHU_APP_ID')
 feishu_app_secret = os.getenv('FEISHU_APP_SECRET')
 feishu_client = FeishuClient(feishu_app_id, feishu_app_secret) if feishu_app_id and feishu_app_secret else None
+figma_access_token = os.getenv('FIGMA_ACCESS_TOKEN', '')  # 可选，Figma API token
 
 llm_client = LLMClient(api_key=api_key, base_url=base_url) if api_key else None
 req_agent = RequirementAnalyzer(llm_client=llm_client, feishu_client=feishu_client)
 point_agent = TestPointGenerator(llm_client=llm_client, feishu_client=feishu_client)
 gen_agent = TestGeneratorAgent(api_key=api_key, base_url=base_url, test_type='web')
 
-# Agent调用锁（防止并发请求竞态修改Agent内部state）
-_agent_lock = threading.Lock()
+# Agent 并发控制：用有界信号量替代全局互斥锁。
+# 之前所有 Agent 调用被单一全局锁串行化，多个任务（pipeline/generate）只能排队执行；
+# 改为有界信号量后，允许多个任务真正并行执行（并发数上限可配，防止打爆 LLM 限流）。
+_MAX_CONCURRENT_TASKS = max(1, int(os.getenv('MAX_CONCURRENT_TASKS', '3') or '3'))
+_agent_semaphore = threading.BoundedSemaphore(_MAX_CONCURRENT_TASKS)
 
 # ---- 异步生成任务状态 ----
 # task_id → {status, progress, total, result, error, created_at, started_at, finished_at, logs}
@@ -250,6 +312,60 @@ def _build_past_batches_summary(past_results: list) -> str:
             lines.append(f"  - 【{mod}】: {', '.join(tps[:3])}{' ...' if len(tps) > 3 else ''}")
         lines.append("")
     return '\n'.join(lines)
+
+# ---- 设计稿分析 ----
+def _build_design_context(feishu_doc_url: str = '', manual_design_urls: list = None,
+                          requirement_text: str = '') -> str:
+    """设计稿分析：飞书内嵌图片 + 文档中提取的 Figma URL + 手动 URL -> design_context 文本
+
+    三路合并，失败静默返回空串。流水线在测试用例生成前调用，耗时 10-60s。
+    """
+    # 从需求文档文本中自动提取 Figma URL
+    figma_urls_from_text = extract_figma_urls_from_text(requirement_text)
+
+    # 合并所有 URL（文档提取 + 手动传入），去重
+    all_urls = list(figma_urls_from_text)
+    if manual_design_urls:
+        for u in manual_design_urls:
+            u = u.strip()
+            if u and u not in all_urls:
+                all_urls.append(u)
+
+    if not feishu_doc_url and not all_urls:
+        return ""
+
+    if figma_urls_from_text:
+        logger.info(f"📋 从需求文档中提取到 {len(figma_urls_from_text)} 个 Figma URL")
+
+    doc_token = ""
+    doc_type = ""
+    if feishu_doc_url:
+        doc_type = "wiki" if "/wiki/" in feishu_doc_url else "doc"
+        doc_token = feishu_doc_url.split("/")[-1].split("?")[0]
+
+    try:
+        feishu_access_token = ""
+        feishu_session = None
+        if feishu_client and doc_token:
+            try:
+                feishu_access_token = feishu_client.get_access_token()
+                feishu_session = feishu_client.session
+            except Exception as e:
+                logger.warning(f"飞书 access_token 获取失败，跳过内嵌图片: {e}")
+
+        context = analyze_design_sources(
+            feishu_doc_token=doc_token,
+            feishu_doc_type=doc_type,
+            feishu_access_token=feishu_access_token,
+            feishu_session=feishu_session,
+            manual_urls=all_urls,
+            figma_token=figma_access_token,
+        )
+        return context
+    except Exception as e:
+        logger.warning(f"设计稿分析失败（不阻塞主流程）: {e}")
+        return ""
+
 
 # ---- YAPI 接口详情拉取 ----
 YAPI_INTERFACE_API = 'https://ugcqams.snowballfinance.com/internal/getInterfaceData'
@@ -452,7 +568,7 @@ def analyze_requirement():
         task_id = f"REQ-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         _set_thread_task_id(task_id)
         logger.info("========== Step 1/3: 需求分析 ==========")
-        with _agent_lock:
+        with _agent_semaphore:
             result = req_agent.process_query(query, title=doc_title, feishu_url=doc_url)
         logger.info(f"✓ 需求分析完成: {result.get('title', '')}，本地: {result.get('local_path', '')}")
 
@@ -500,15 +616,16 @@ def generate_test_points():
         query = data.get('query', '')
         test_type = data.get('test_type', 'web')
         source = data.get('source', 'code')
-        task_id = data.get('task_id', '')
+        _user_provided_task_id = data.get('task_id', '')  # 用户显式传的（可能为空）
+        task_id = _user_provided_task_id or f"TP-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         prd_url = data.get('prd_url', '')
         raw_prd_text = data.get('raw_prd', '')
 
-        if task_id:
-            _set_thread_task_id(task_id)
-        # task_id 优先：根据 ID 从 history 找到需求分析 md，跳过需求分析直接出测试点
-        logger.info("========== Step 2/3: 测试点生成 ==========")
-        if task_id:
+        _set_thread_task_id(task_id)
+        logger.info(f"========== Step 2/3: 测试点生成 (task_id={task_id}) ==========")
+
+        if _user_provided_task_id:
+            # 分支A：基于已有需求分析结果生成测试点（全流程模式 or 复用历史）
             req_md_text = ''
             req_title = ''
             yapi_urls = []
@@ -533,7 +650,10 @@ def generate_test_points():
             logger.info(f"task_id={task_id}, 加载需求分析文档 {len(req_md_text)}字符, YAPI接口 {len(yapi_urls)}个")
             # 拉取 YAPI 接口详情（供 AI 在测试点生成时参考）
             yapi_interfaces = _fetch_yapi_interfaces(yapi_urls)
-            with _agent_lock:
+            # 设计稿分析（从需求文档中提取 Figma URL）
+            source_doc_url = matched_item.get('source_doc_url', '') if matched_item else ''
+            design_ctx = _build_design_context(source_doc_url, [], req_md_text)
+            with _agent_semaphore:
                 result = point_agent.execute({
                     'requirements': [{'function': 'all', 'name': req_title, 'complexity': 'medium',
                                       'test_points': ['功能逻辑'], 'description': req_md_text[:6000]}],
@@ -541,9 +661,10 @@ def generate_test_points():
                     'source': 'prd',
                     'raw_prd': req_md_text,
                     'title': req_title,
-                    'source_doc_url': matched_item.get('source_doc_url', '') if matched_item else '',
+                    'source_doc_url': source_doc_url,
                     'analysis_doc_url': matched_item.get('feishu_url', '') if matched_item else '',
                     'yapi_interfaces': yapi_interfaces,
+                    'design_context': design_ctx,
                 })
 
             # 把测试点 JSON 路径 + 测试点飞书文档 URL 写回 history，供 /api/generate task_id 查找
@@ -587,7 +708,9 @@ def generate_test_points():
                     raw_prd_text = feishu_client.get_doc_content(token, doc_type, doc_url=feishu_url)
                 except Exception as e:
                     return jsonify({'error': f'飞书PRD拉取失败: {e}'}), 500
-            with _agent_lock:
+            with _agent_semaphore:
+                # 设计稿分析
+                design_ctx = _build_design_context(prd_url or '', [], raw_prd_text)
                 result = point_agent.execute({
                     'requirements': [{'function': 'all', 'name': 'PRD文档', 'complexity': 'medium',
                                       'test_points': ['功能逻辑'], 'description': raw_prd_text[:6000]}],
@@ -595,6 +718,7 @@ def generate_test_points():
                     'source': 'prd',
                     'raw_prd': raw_prd_text,
                     'title': 'PRD直提',
+                    'design_context': design_ctx,
                 })
             return jsonify({
                 'success': True,
@@ -617,11 +741,13 @@ def generate_test_points():
                 exec_input['raw_prd'] = data['raw_prd']
             if data.get('structured_constraints'):
                 exec_input['structured_constraints'] = data['structured_constraints']
-            with _agent_lock:
+            if data.get('raw_prd'):
+                exec_input['design_context'] = _build_design_context('', [], data['raw_prd'])
+            with _agent_semaphore:
                 result = point_agent.execute(exec_input)
         elif query:
             # 自然语言输入
-            with _agent_lock:
+            with _agent_semaphore:
                 result = point_agent.process_query(query, {'test_type': test_type, 'source': source})
         else:
             return jsonify({'error': '请提供 requirements 列表或 query 自然语言'}), 400
@@ -661,6 +787,8 @@ def _run_generate_in_background(task_id: str, payload: dict):
     try:
         task_id_in = payload.get('task_id', '')
         _progress_log(f"========== Step 1/3: 加载测试点数据 task_id={task_id_in} ==========")
+
+        design_urls = payload.get('design_urls') or []
 
         # 从 history 查找测试点 JSON + 需求文档
         tp_json_path = None
@@ -781,10 +909,12 @@ def _run_generate_in_background(task_id: str, payload: dict):
             try:
                 sc = batch.get('shared_context') or {}
                 sc['requirement_context'] = requirement_context
+                design_context = _build_design_context(source_doc_url, design_urls, requirement_context)
                 sc['yapi_context'] = yapi_context
+                sc['design_context'] = design_context
                 sc['past_batches_summary'] = _build_past_batches_summary(all_results)
                 batch['shared_context'] = sc
-                with _agent_lock:
+                with _agent_semaphore:
                     result = gen_agent.execute_batch(batch)
                 all_results.append(result)
                 case_count = len(result.get('test_cases', []))
@@ -915,12 +1045,13 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
 
     doc_url = payload.get('doc_url', '')
     selected_platforms = _expand_platforms(payload.get('selected_platforms'))
+    design_urls = payload.get('design_urls') or []
 
     # ============ Step 1: 需求分析 ============
     try:
         _plog("🚀 [Pipeline] 启动全流程，飞书URL: " + doc_url[:80])
         _plog("========== Step 1/3: 需求分析 ==========")
-        with _agent_lock:
+        with _agent_semaphore:
             req_result = req_agent.process_query(doc_url, feishu_url=doc_url)
 
         req_title = ''
@@ -971,7 +1102,11 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
         yapi_urls = meta.get('yapi_urls', [])
         yapi_interfaces = _fetch_yapi_interfaces(yapi_urls)
 
-        with _agent_lock:
+        # 设计稿分析（在测试点生成前执行，让测试点也能参考 UI 元素）
+        _plog("========== 设计稿分析 ==========")
+        design_context = _build_design_context(doc_url, design_urls, req_md_text)
+
+        with _agent_semaphore:
             tp_result = point_agent.execute({
                 'requirements': [{'function': 'all', 'name': req_title, 'complexity': 'medium',
                                   'test_points': ['功能逻辑'], 'description': req_md_text[:6000]}],
@@ -980,6 +1115,7 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
                 'source_doc_url': doc_url,
                 'analysis_doc_url': req_result.get('feishu_url', ''),
                 'yapi_interfaces': yapi_interfaces,
+                'design_context': design_context,
             })
 
         json_path = tp_result.get('json_path') or tp_result.get('test_points_json_path', '')
@@ -1083,10 +1219,12 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
             try:
                 sc = batch.get('shared_context') or {}
                 sc['requirement_context'] = req_md_text[:30000]
+                design_context = _build_design_context(doc_url, design_urls, req_md_text)
                 sc['yapi_context'] = yapi_context
+                sc['design_context'] = design_context
                 sc['past_batches_summary'] = _build_past_batches_summary(all_results)
                 batch['shared_context'] = sc
-                with _agent_lock:
+                with _agent_semaphore:
                     result = gen_agent.execute_batch(batch)
                 all_results.append(result)
                 case_count = len(result.get('test_cases', []))
@@ -1196,6 +1334,7 @@ def pipeline_async():
         return jsonify({'error': 'doc_url 不合法，需要 http(s):// 开头'}), 400
 
     selected_platforms = data.get('selected_platforms') or None
+    design_urls = data.get('design_urls') or []
 
     pipeline_task_id = f"PIPE-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     with _pipeline_tasks_lock:
@@ -1210,6 +1349,7 @@ def pipeline_async():
     payload = {
         'doc_url': doc_url,
         'selected_platforms': selected_platforms,
+        'design_urls': design_urls,
         '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
     t = threading.Thread(target=_run_pipeline_in_background, args=(pipeline_task_id, payload), daemon=True)
@@ -1256,6 +1396,7 @@ def generate_test_async():
         return jsonify({'error': '缺少 task_id'}), 400
 
     selected_platforms = data.get('selected_platforms') or None  # 可选：如 ['client_common', 'backend']
+    design_urls = data.get('design_urls') or []
 
     new_task_id = f"GEN-{task_id_in}-{datetime.now().strftime('%H%M%S')}"
     with _generation_tasks_lock:
@@ -1269,6 +1410,7 @@ def generate_test_async():
     payload = {
         'task_id': task_id_in,
         'selected_platforms': selected_platforms,
+        'design_urls': design_urls,
         '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
     t = threading.Thread(target=_run_generate_in_background, args=(new_task_id, payload), daemon=True)
@@ -1362,6 +1504,7 @@ def generate_test():
         query = data.get('query', '')
         requirement_doc = data.get('requirement_doc', '')
         context = data.get('context', {})
+        design_urls = data.get('design_urls') or []
 
         # ---- task_id 路径：从测试点 JSON 加载 batches 逐批生成 → 整合飞书 ----
         if task_id:
@@ -1456,13 +1599,15 @@ def generate_test():
 
             # 逐批生成 JSON 测试用例
             all_results = []
-            with _agent_lock:
+            with _agent_semaphore:
                 for batch in flattened_batches:
                     try:
                         # 注入需求文档 + YAPI + 前序 batch 摘要
                         sc = batch.get('shared_context') or {}
                         sc['requirement_context'] = requirement_context
+                        design_context = _build_design_context(source_doc_url, design_urls, requirement_context)
                         sc['yapi_context'] = yapi_context
+                        sc['design_context'] = design_context
                         sc['past_batches_summary'] = _build_past_batches_summary(all_results)
                         batch['shared_context'] = sc
                         result = gen_agent.execute_batch(batch)
@@ -1581,7 +1726,7 @@ def generate_test():
         if not full_query:
             return jsonify({'error': '请输入需求文档或补充说明'}), 400
 
-        with _agent_lock:
+        with _agent_semaphore:
             result = gen_agent.process_query(full_query, context)
 
         with open(result['file_path'], 'r', encoding='utf-8') as f:
@@ -1673,22 +1818,97 @@ def delete_history_item():
 
 @app.route('/api/logs')
 def get_logs():
-    """前端日志面板拉取增量日志（?since=<seq>&task_id=<id>）"""
+    """前端日志面板拉取增量日志（?since=<seq>&task_id=<id>）
+    
+    双通道策略：
+    1. 内存缓冲（活跃 task 的实时日志）
+    2. task 文件兜底（服务重启后 / 或内存缓冲空时，从 logs/task_{id}.log 加载）
+    """
     try:
         since = int(request.args.get('since', '0'))
     except ValueError:
         since = 0
     filter_tid = request.args.get('task_id', '').strip()
+
+    source = 'buffer'
     with _log_lock:
         items = [(s, t) for s, t in _log_buffer if s > since]
         latest = _log_seq
+
+    # 先做内存缓冲的 task_id 过滤
     if filter_tid:
-        items = [(s, t) for s, t in items if filter_tid in t]
+        filtered = [(s, t) for s, t in items if filter_tid in t]
+    else:
+        filtered = items
+
+    # ⭐ 过滤后为空 + 有 task_id + 从 0 开始拉 → 从 task 文件兜底
+    if not filtered and filter_tid and since == 0:
+        filtered = _load_task_log_from_file(filter_tid)
+        latest = max([s for s, _ in filtered], default=latest)
+        source = 'file_fallback'
+
     return jsonify({
-        'logs': [{'seq': s, 'text': t} for s, t in items],
+        'logs': [{'seq': s, 'text': t} for s, t in filtered],
         'latest': latest,
         'filter_task_id': filter_tid,
+        'source': source,
     })
+
+
+def _load_task_log_from_file(task_id: str) -> list[tuple[int, str]]:
+    """从 logs/task_{task_id}.log 加载完整日志行。每行分配一个 seq（基于文件行号）。"""
+    path = _task_log_path(task_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        # 用文件行号作为 seq（从 1 开始），保证 since=0 能拉全量
+        return [(i + 1, line.rstrip('\n')) for i, line in enumerate(lines) if line.strip()]
+    except Exception:
+        return []
+
+
+@app.route('/api/logs/export')
+def export_task_log():
+    """下载某个 task 的完整日志文件（?task_id=xxx）"""
+    task_id = request.args.get('task_id', '').strip()
+    if not task_id:
+        return jsonify({'error': 'task_id is required'}), 400
+    path = _task_log_path(task_id)
+    if not os.path.exists(path):
+        return jsonify({'error': f'log file not found for task {task_id}'}), 404
+    # 生成下载文件名：task_{task_id}_{timestamp}.log
+    download_name = f"task_{re.sub(r'[^\w\-]', '_', task_id)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    return send_from_directory(
+        _LOGS_DIR,
+        os.path.basename(path),
+        as_attachment=True,
+        download_name=download_name,
+    )
+
+
+@app.route('/api/logs/list')
+def list_task_logs():
+    """列出所有 task 日志文件（历史任务追溯）"""
+    try:
+        files = []
+        for name in os.listdir(_LOGS_DIR):
+            if name.startswith('task_') and name.endswith('.log'):
+                fp = os.path.join(_LOGS_DIR, name)
+                stat = os.stat(fp)
+                # 从文件名提取 task_id
+                tid = name[len('task_'):-len('.log')]
+                files.append({
+                    'task_id': tid,
+                    'filename': name,
+                    'size_kb': round(stat.st_size / 1024, 1),
+                    'mtime': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                })
+        files.sort(key=lambda x: x['mtime'], reverse=True)
+        return jsonify({'logs': files, 'count': len(files)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/pipeline', methods=['POST'])
@@ -1780,6 +2000,8 @@ def run_pipeline():
         }
         if raw_prd:
             point_input['raw_prd'] = raw_prd
+            # 设计稿分析（注入测试点生成）
+            point_input['design_context'] = _build_design_context(query, [], raw_prd)
         point_result = point_agent.execute(point_input)
         scenarios = point_result['scenarios']
         logger.info(f"测试点生成: {len(scenarios)}个场景")
@@ -1820,12 +2042,14 @@ def run_pipeline():
             yapi_context_pipe = '（无 YAPI 接口关联信息）'
             pipe_all_results = []
 
-            with _agent_lock:
+            with _agent_semaphore:
                 for batch in _pipe_batches:
                     try:
                         sc = batch.get('shared_context') or {}
                         sc['requirement_context'] = raw_prd_text[:30000] if raw_prd_text else '（无）'
+                        design_context = _build_design_context(query if query and ('feishu.cn' in query or 'larksuite.com' in query) else '', data.get('design_urls') or [], raw_prd_text or '')
                         sc['yapi_context'] = yapi_context_pipe
+                        sc['design_context'] = design_context
                         sc['past_batches_summary'] = _build_past_batches_summary(pipe_all_results)
                         batch['shared_context'] = sc
 

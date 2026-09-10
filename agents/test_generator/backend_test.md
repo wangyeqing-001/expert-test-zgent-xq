@@ -41,6 +41,9 @@
 ### 关联接口信息
 {yapi_context}
 
+### 设计稿 UI 元素参考（多模态识别产物）
+{design_context}
+
 ### 前序批次摘要（避免重复生成）
 {past_batches_summary}
 

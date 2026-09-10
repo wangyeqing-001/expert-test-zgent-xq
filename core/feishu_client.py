@@ -3,6 +3,7 @@ import os
 import re
 import time
 import functools
+import threading
 import requests
 import logging
 from typing import Optional
@@ -81,6 +82,9 @@ class FeishuClient:
         self.app_secret = app_secret
         self.access_token = None
         self._token_expires_at = 0  # token过期时间戳
+        self._token_lock = threading.Lock()   # access_token 刷新互斥（多任务并行安全）
+        self._related_urls_cache: dict = {}   # doc_token → 关联文档URL列表（按文档隔离，避免跨任务串数据）
+        self._related_urls_lock = threading.Lock()
         self.base_url = "https://open.feishu.cn/open-apis"
         self.domain = os.getenv('FEISHU_DOMAIN', '')
         # 统一会话：绕过系统代理直连（避免抓包代理导致SSL验证失败）
@@ -125,11 +129,20 @@ class FeishuClient:
     @retry(max_retries=3)
     def get_access_token(self) -> str:
         """获取访问令牌（自动刷新过期token）"""
-        # 提前60秒刷新，避免边界过期
+        # 提前60秒刷新，避免边界过期；未过期直接返回（无锁快速路径，多线程只读安全）
         if self.access_token and time.time() < self._token_expires_at - 60:
             logger.debug("使用缓存的access_token")
             return self.access_token
-        
+
+        with self._token_lock:
+            # 双重检查：抢到锁后可能已被其他线程刷新，避免并发重复请求
+            if self.access_token and time.time() < self._token_expires_at - 60:
+                logger.debug("使用缓存的access_token")
+                return self.access_token
+            return self._fetch_access_token()
+
+    def _fetch_access_token(self) -> str:
+        """实际请求飞书换取 access_token（调用方需持有 _token_lock）"""
         logger.info(f"正在获取飞书access_token, app_id={self.app_id[:8]}...")
         url = f"{self.base_url}/auth/v3/tenant_access_token/internal"
         payload = {
@@ -182,9 +195,10 @@ class FeishuClient:
                 if qadoc_result and qadoc_result['content']:
                     content = qadoc_result['content']
                     logger.info(f"{log_prefix} qadoc拉取成功, 长度={len(content)}字符")
-                    # 缓存关联文档 URL 供 get_related_doc_urls 使用
+                    # 缓存关联文档 URL 供 get_related_doc_urls 使用（按 doc_token 隔离，多任务并行不串数据）
                     if context == '主文档':
-                        self._cached_related_urls = qadoc_result.get('related_urls', [])
+                        with self._related_urls_lock:
+                            self._related_urls_cache[doc_token] = qadoc_result.get('related_urls', [])
                     return content
             except Exception as e:
                 logger.warning(f"{log_prefix} qadoc拉取失败(重试后): {e}, 降级飞书OpenAPI")
@@ -215,8 +229,9 @@ class FeishuClient:
         优先从 qadoc 的 sub_document_ids 获取（最准），
         降级：用 blocks API 递归扫 mention_doc（飞书 raw_content 会丢 URL）
         """
-        # 1. 优先用 get_doc_content 已缓存的 qadoc 结果
-        cached = getattr(self, '_cached_related_urls', None)
+        # 1. 优先用 get_doc_content 已缓存的 qadoc 结果（按 doc_token 隔离，多任务并行不串数据）
+        with self._related_urls_lock:
+            cached = self._related_urls_cache.get(doc_token)
         if cached is not None:
             return cached
 
@@ -228,7 +243,10 @@ class FeishuClient:
             try:
                 qadoc_result = self._qadoc_fetch(url)
                 if qadoc_result:
-                    return qadoc_result.get('related_urls', [])
+                    urls = qadoc_result.get('related_urls', [])
+                    with self._related_urls_lock:
+                        self._related_urls_cache[doc_token] = urls
+                    return urls
             except Exception as e:
                 logger.warning(f"qadoc拉取关联文档失败(重试后): {e}, 降级blocks API")
 
