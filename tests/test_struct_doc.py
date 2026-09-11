@@ -58,11 +58,14 @@ class TestDirtyJsonInterception:
         assert nodes is not None and nodes[0]['text'] == '标题'
 
     def test_trailing_comma(self):
-        """JSON末尾多逗号 → 标准json.loads失败，截取数组区间也失败 → 返回None触发降级"""
+        """JSON末尾多逗号 → JSON修复逻辑自动去除尾逗号后正常解析"""
         raw = '[{"type":"h1","text":"标题"},]'
-        # json.loads 对尾逗号报错；本实现不抛异常，返回None由上层降级
+        # 尾逗号是 LLM 输出常见错误，实现应自动修复并返回解析结果
         nodes = parse_struct_json(raw)
-        assert nodes is None
+        assert nodes is not None
+        assert len(nodes) == 1
+        assert nodes[0]['type'] == 'h1'
+        assert nodes[0]['text'] == '标题'
 
     def test_table_headers_rows_mismatch(self):
         """table headers长度与rows单元格数量不一致 → 自动补齐/截断（告警不中断）"""

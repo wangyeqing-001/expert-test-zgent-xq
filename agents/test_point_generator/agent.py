@@ -170,37 +170,17 @@ class TestPointGenerator(BaseAgent):
         })
     
     def _parse_requirements_from_query(self, query: str) -> list:
-        """从自然语言中提取需求列表"""
-        # 尝试LLM解析
-        if self.llm:
-            prompt = f"""你是需求解析助手。从用户查询中提取功能需求，返回JSON格式。
-
-用户查询: {query}
-
-返回格式：{{"requirements": [{{"function": "函数名", "complexity": "medium", "test_points": ["测试点"]}}]}}
-如无法提取具体函数，返回：{{"requirements": [{{"function": "all", "name": "用户需求", "complexity": "medium", "test_points": ["功能逻辑"], "description": "原始查询内容"}}]}}
-只返回JSON。"""
-            try:
-                response = self.llm.generate(prompt)
-                cleaned = re.sub(r'```(?:json)?\s*', '', response)
-                cleaned = re.sub(r'```', '', cleaned)
-                json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group(0))
-                    reqs = result.get('requirements', [])
-                    if reqs:
-                        return reqs
-            except Exception as e:
-                print(f"⚠ [TestPointGenerator] LLM解析查询失败: {e}")
-        
-        # 降级：提取英文函数名作为需求（排除常见非函数词）
+        """从自然语言中提取需求列表（纯规则，不调 LLM：
+        英文函数名用正则提取，纯中文则整段作为单条需求）
+        """
+        # 提取英文函数名作为需求（排除常见非函数词）
         _STOPWORDS = {'the', 'a', 'an', 'to', 'is', 'are', 'for', 'and', 'or', 'of', 'in',
                       'web', 'api', 'test', 'app', 'h5', 'all', 'if', 'else', 'this', 'that'}
         func_names = [w for w in re.findall(r'\b([a-zA-Z_]\w*)\b', query)
                       if w.lower() not in _STOPWORDS and len(w) > 1]
         if func_names:
             return [{'function': name, 'complexity': 'medium', 'test_points': ['功能逻辑']} for name in func_names[:3]]
-        
+
         # 最低降级：整段查询作为单条需求
         return [{'function': 'all', 'name': '用户需求', 'complexity': 'medium', 'test_points': ['功能逻辑'], 'description': query[:500]}]
     
@@ -317,6 +297,88 @@ class TestPointGenerator(BaseAgent):
         except Exception as e:
             logger.warning(f"  ⚠ [约束清单] 提取失败(跳过): {type(e).__name__}: {str(e)[:100]}")
             return ''
+
+    @staticmethod
+    def _extract_constraints_by_rules(prd_text: str) -> str:
+        """规则提取约束清单（确定性，零 LLM 成本）：
+        抓取含约束关键词的句子（必须/不得/边界/格式/长度/必填 等）作为"防遗漏索引"。
+        规则命中为空时，上层再走 LLM 兜底提取。
+        """
+        _KEYWORDS = (
+            '必须', '不得', '禁止', '不允许', '不能', '仅', '只允许', '只可', '至少', '不超过',
+            '上限', '下限', '最大', '最小', '范围', '格式', '长度', '位数', '校验', '必填',
+            '可选', '枚举', '默认', '超时', '限制', '权限', '边界', '有效期', '白名单', '黑名单',
+        )
+        lines = []
+        seen = set()
+        for raw in (prd_text or '').split('\n'):
+            line = raw.strip()
+            if not line or len(line) > 120 or len(line) < 4:
+                continue
+            if not any(kw in line for kw in _KEYWORDS):
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            lines.append(f"- {line}")
+            if len(lines) >= 30:
+                break
+        if not lines:
+            return ''
+        heading = ('### 数据/字段约束清单\n'
+                   if any(kw in ''.join(lines) for kw in ('长度', '格式', '范围', '必填', '枚举', '上限', '下限', '最大', '最小', '位数'))
+                   else '### 业务规则与状态流转清单\n')
+        return heading + '\n'.join(lines)
+
+    @staticmethod
+    def _pre_tag_interfaces(yapi_interfaces: list, prd_text: str) -> tuple:
+        """程序预判接口标签（确定性，减少 LLM 打标负担）：
+        - 接口路径/主干/标题在 PRD 文本中出现 → 待 LLM 判定（本次新增/修改/存量复用-建议回归）
+        - 未出现 → 程序直接打标「存量复用-无需测试」，不占 LLM 额度
+        :return: (pending_interfaces, pre_tagged_index)
+        """
+        if not yapi_interfaces:
+            return [], []
+        text = prd_text or ''
+        text_compact = re.sub(r'\s+', '', text)  # 去空白，提高路径匹配率
+        pending = []
+        pre_tagged = []
+        for item in yapi_interfaces:
+            path = (item.get('api_path') or '').strip()
+            title = (item.get('title') or '').strip()
+            method = (item.get('method') or '').upper()
+            # 候选匹配串：原样路径 / 去首斜杠 / 参数占位符归一化 / 主干最后一段 / 标题
+            candidates = set()
+            if path:
+                candidates.add(path)
+                stripped = path.lstrip('/')
+                candidates.add(stripped)
+                normalized = re.sub(r'(:|{[^}]*}/?)', '', path).rstrip('/').strip('/')
+                if normalized and normalized != stripped:
+                    candidates.add(normalized)
+                last_seg = stripped.rsplit('/', 1)[-1]
+                if last_seg and len(last_seg) >= 3:
+                    candidates.add(last_seg)
+            if title:
+                candidates.add(title)
+            appears = False
+            for cand in candidates:
+                if not cand:
+                    continue
+                if cand in text or re.sub(r'\s+', '', cand) in text_compact:
+                    appears = True
+                    break
+            if appears:
+                pending.append(item)
+            else:
+                pre_tagged.append({
+                    'title': title,
+                    'api_path': path,
+                    'method': method,
+                    'tag': '存量复用-无需测试',
+                    'reason': '接口未在需求文档中提及，程序预判为存量接口，无需测试',
+                })
+        return pending, pre_tagged
     
     def _extract_testpoints_from_prd(self, prd_text: str, structured_constraints: str = None,
                                        yapi_interfaces: list = None,
@@ -329,16 +391,26 @@ class TestPointGenerator(BaseAgent):
         if not (self.llm and prd_text):
             return [], []
         try:
-            # === P0-3 优化：约束提取（LLM IO） + YAPI 格式化（CPU） 并行 ===
+            # === LLM 瘦身：程序预判接口标签（未在 PRD 提及的接口不打给 LLM）===
+            pending_interfaces, pre_tagged_index = self._pre_tag_interfaces(yapi_interfaces, prd_text[:30000])
+            if pre_tagged_index:
+                print(f"✓ [TestPointGenerator] 程序预判 {len(pre_tagged_index)} 个接口为「存量复用-无需测试」，跳过 LLM 打标")
+
+            # === 优化：约束提取（规则优先，LLM 兜底） + YAPI 格式化（CPU） 并行 ===
             cache_key = hashlib.md5((prd_text[:10000] or '').encode()).hexdigest()[:12]
             cache_dir = os.path.join(os.path.dirname(_DIR), 'generated_requirements')
             cache_path = os.path.join(cache_dir, f'_constraints_cache_{cache_key}.txt')
 
             def _extract_constraints_with_cache() -> str:
-                """带本地文件缓存的约束清单提取"""
+                """约束清单提取：规则优先（零成本），规则未命中再走 LLM + 本地缓存"""
                 if structured_constraints is not None:
                     return structured_constraints  # 外部已传入
-                # 查缓存
+                # 规则优先：确定性提取约束句，命中即返回（不调 LLM、不写缓存）
+                rule_constraints = self._extract_constraints_by_rules(prd_text)
+                if rule_constraints:
+                    logger.info(f"  ✓ [约束清单] 规则提取命中 ({len(rule_constraints)}字符)，跳过 LLM")
+                    return rule_constraints
+                # 规则未命中 → 查缓存
                 if os.path.exists(cache_path):
                     try:
                         with open(cache_path, 'r') as f:
@@ -348,7 +420,7 @@ class TestPointGenerator(BaseAgent):
                             return cached
                     except Exception:
                         pass
-                # 未命中，调 LLM
+                # 缓存也未命中 → LLM 兜底提取
                 result = self._extract_constraints(prd_text)
                 # 写缓存（后台失败不阻塞主流程）
                 try:
@@ -360,11 +432,11 @@ class TestPointGenerator(BaseAgent):
                 return result
 
             def _format_yapi() -> str:
-                """纯 CPU 的 YAPI 格式化"""
-                if not yapi_interfaces:
+                """纯 CPU 的 YAPI 格式化（只格式化待 LLM 判定的接口）"""
+                if not pending_interfaces:
                     return '（无接口数据）'
                 yapi_lines = []
-                for i, item in enumerate(yapi_interfaces, 1):
+                for i, item in enumerate(pending_interfaces, 1):
                     title = item.get('title', '未知')
                     path = item.get('api_path', '未知')
                     method = item.get('method', '未知')
@@ -415,6 +487,9 @@ class TestPointGenerator(BaseAgent):
             logger.info(f"  [DEBUG] LLM 原始输出已落盘: {_debug_path}")
 
             parsed, interface_index = self._parse_llm_json(response)
+            # 合并：程序预判的「存量复用-无需测试」 + LLM 打标结果（预判在前，不丢接口）
+            if pre_tagged_index:
+                interface_index = pre_tagged_index + (interface_index or [])
             points = []
             if isinstance(parsed, list):
                 # ===== 新：扁平数组路径 =====
@@ -436,9 +511,9 @@ class TestPointGenerator(BaseAgent):
             # 后验检查：backend/admin 测试点为 0 但有 YAPI → 警告
             backend_scopes = {'backend', 'admin'}
             backend_points = [p for p in points if p.get('scope') in backend_scopes]
-            if len(backend_points) < 3 and yapi_lines:
-                backend_in_yapi = [l for l in yapi_lines if 'backend' in l.lower() or 'admin' in l.lower()]
-                print(f"⚠ [TestPointGenerator] backend/admin 测试点仅 {len(backend_points)} 个（<3），但有 YAPI 接口 {len(yapi_lines)} 个（其中 {len(backend_in_yapi)} 个疑似后端/管理）。"
+            total_yapi = len(yapi_interfaces or [])
+            if len(backend_points) < 3 and total_yapi:
+                print(f"⚠ [TestPointGenerator] backend/admin 测试点仅 {len(backend_points)} 个（<3），但有 YAPI 接口 {total_yapi} 个。"
                       f"建议检查 prompt 中的强制约束是否生效，或重新生成。")
 
             # 后验检查：scope 分布

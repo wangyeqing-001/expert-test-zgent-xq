@@ -28,18 +28,13 @@ class IntentDispatcher:
     
     def detect_intent(self, text: str) -> str:
         """识别用户意图，返回 requirement/test_point/generate"""
-        # 1. 关键词匹配
+        # 关键词规则匹配（已覆盖主要意图，零延迟）
         intent = self._match_intent(text)
         if intent:
             return intent
-        
-        # 2. LLM分类兜底
-        if self.llm_client:
-            intent = self._classify_with_llm(text)
-            if intent:
-                return intent
-        
-        # 3. 默认需求分析
+
+        # 关键词未命中 → 默认需求分析
+        # （原 LLM 分类兜底已移除：关键词表已覆盖主要意图，为分类额外调 LLM 成本高收益低）
         return 'requirement'
     
     def dispatch(self, text: str) -> dict:
@@ -66,27 +61,4 @@ class IntentDispatcher:
             for kw in keywords:
                 if kw in text:
                     return intent
-        return ''
-    
-    def _classify_with_llm(self, text: str) -> str:
-        """用LLM分类用户意图"""
-        prompt = f"""你是意图分类器。根据用户消息判断要执行的操作。
-
-用户消息: {text[:300]}
-
-分类选项:
-- requirement: 需求分析、分析文档/代码/链接、提取功能点
-- test_point: 生成测试场景、测试点列表
-- generate: 生成测试代码、编写测试用例
-
-只返回一个单词: requirement / test_point / generate"""
-        
-        try:
-            response = self.llm_client.generate(prompt, max_tokens=50)
-            result = response.strip().lower()
-            if result in ('requirement', 'test_point', 'generate'):
-                return result
-        except Exception as e:
-            logger.warning(f"LLM意图分类失败: {e}")
-        
         return ''

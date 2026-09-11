@@ -2,7 +2,6 @@
 
 import os
 import re
-import json
 import time
 import logging
 from typing import Any
@@ -496,33 +495,12 @@ class RequirementAnalyzer(BaseAgent):
     # ==================== 意图解析 ====================
 
     def _parse_query(self, query: str) -> dict:
-        """用 LLM（或降级规则）解析用户输入意图：PRD 文档 or 代码文件路径"""
+        """纯规则解析用户输入意图：代码文件路径 / PRD 文本 / test_type（不调 LLM）
+        规则可完全覆盖：路径存在性判断用 os.path.exists，PRD/类型用关键词，无需语义模型。
+        """
         result = {'file_path': None, 'test_type': 'web', 'is_prd': False}
 
-        # 尝试 LLM 解析
-        if self.llm:
-            try:
-                prompt = (
-                    f"你是参数提取助手。从以下用户输入中提取结构化参数，返回 JSON。\n"
-                    f"字段：is_prd(bool), file_path(str|null), test_type(web|mobile|api)\n"
-                    f"用户输入：{query[:500]}\n"
-                    f"只返回 JSON，不要解释。"
-                )
-                response = self.llm.generate(prompt)
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    parsed = json.loads(json_match.group(0))
-                    if parsed.get('is_prd'):
-                        return {'file_path': None, 'test_type': 'web', 'is_prd': True}
-                    if parsed.get('file_path'):
-                        result['file_path'] = parsed['file_path']
-                    if parsed.get('test_type'):
-                        result['test_type'] = parsed['test_type']
-                    return result
-            except Exception:
-                pass  # LLM 解析失败，降级到规则匹配
-
-        # 规则降级：正则匹配代码文件路径
+        # 1. 正则匹配代码文件路径（存在才认定为代码路径）
         path_pattern = r'[\w./-]+\.(?:py|js|ts|jsx|tsx|java|go)'
         matches = re.findall(path_pattern, query)
         for match in matches:
@@ -530,12 +508,16 @@ class RequirementAnalyzer(BaseAgent):
                 result['file_path'] = match
                 break
 
-        # 关键词匹配测试类型
+        # 2. 关键词匹配测试类型
         q_lower = query.lower()
         if any(kw in q_lower for kw in ['移动端', 'appium', 'mobile', 'app']):
             result['test_type'] = 'mobile'
         elif any(kw in q_lower for kw in ['api', '接口', 'http', 'request']):
             result['test_type'] = 'api'
+
+        # 3. PRD 语义判定：无代码路径 + 出现 PRD/需求/文档 等词 → 按 PRD 文本处理
+        if not result['file_path'] and any(kw in query for kw in ('PRD', 'prd', '需求', '文档', 'Doc')):
+            result['is_prd'] = True
 
         return result
 

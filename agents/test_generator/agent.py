@@ -198,7 +198,9 @@ class TestGeneratorAgent(BaseAgent):
         })
     
     def _parse_query(self, query: str) -> dict:
-        """解析自然语言查询，提取测试参数"""
+        """解析自然语言查询，提取测试参数（纯规则，不调 LLM：
+        函数名/源文件用正则、场景类型/优先级/测试点用关键词，规则已完全覆盖）
+        """
         import re
         
         result = {
@@ -210,32 +212,6 @@ class TestGeneratorAgent(BaseAgent):
             'source_file': None
         }
         
-        # 尝试用LLM解析（优先）
-        if self.llm:
-            prompt = f"""你是测试参数提取助手。从用户查询中提取测试生成参数。
-
-用户查询: {query}
-
-要求：
-1. 提取函数名（如"login函数"中的"login"）
-2. 识别场景类型：normal/edge_case/error_handling（默认normal）
-3. 识别优先级：high/medium/low（默认medium）
-4. 提取测试点列表（如"异常处理、超时重试"→["异常处理", "超时重试"]）
-5. 提取源文件名（如果有）
-6. 返回JSON格式：{{"function": "", "scenario_type": "normal", "priority": "medium", "test_points": [], "source_file": ""}}
-
-只返回JSON，无解释。"""
-            
-            try:
-                response = self.llm.generate(prompt)
-                import json
-                parsed = json.loads(response)
-                result.update({k: v for k, v in parsed.items() if v})
-                return result
-            except Exception as e:
-                print(f"LLM解析失败，使用规则匹配: {e}")
-        
-        # 降级方案：规则匹配
         # 提取函数名（匹配"xxx函数"或"function xxx"）
         func_pattern = r'([a-zA-Z_]\w*)函数|function\s+([a-zA-Z_]\w*)'
         func_match = re.search(func_pattern, query)
