@@ -315,11 +315,18 @@ def _build_past_batches_summary(past_results: list) -> str:
 
 # ---- 设计稿分析 ----
 def _build_design_context(feishu_doc_url: str = '', manual_design_urls: list = None,
-                          requirement_text: str = '') -> str:
+                          requirement_text: str = '',
+                          manual_design_text: str = '') -> str:
     """设计稿分析：飞书内嵌图片 + 文档中提取的 Figma URL + 手动 URL -> design_context 文本
 
     三路合并，失败静默返回空串。流水线在测试用例生成前调用，耗时 10-60s。
+    若 manual_design_text 非空，直接返回该文本，跳过 Figma API 和飞书图片提取。
     """
+    # 优先级最高：用户手动输入的设计稿文本 → 直接使用，跳过 Figma API 请求流程
+    if manual_design_text and manual_design_text.strip():
+        logger.info(f"✏️ 使用用户手动输入的设计稿文本（{len(manual_design_text)} 字），跳过 Figma API")
+        return manual_design_text.strip()
+
     # 从需求文档文本中自动提取 Figma URL
     figma_urls_from_text = extract_figma_urls_from_text(requirement_text)
 
@@ -620,6 +627,7 @@ def generate_test_points():
         task_id = _user_provided_task_id or f"TP-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         prd_url = data.get('prd_url', '')
         raw_prd_text = data.get('raw_prd', '')
+        design_text = data.get('design_text', '')
 
         _set_thread_task_id(task_id)
         logger.info(f"========== Step 2/3: 测试点生成 (task_id={task_id}) ==========")
@@ -652,7 +660,8 @@ def generate_test_points():
             yapi_interfaces = _fetch_yapi_interfaces(yapi_urls)
             # 设计稿分析（从需求文档中提取 Figma URL）
             source_doc_url = matched_item.get('source_doc_url', '') if matched_item else ''
-            design_ctx = _build_design_context(source_doc_url, [], req_md_text)
+            design_ctx = _build_design_context(source_doc_url, [], req_md_text,
+                                               manual_design_text=design_text)
             with _agent_semaphore:
                 result = point_agent.execute({
                     'requirements': [{'function': 'all', 'name': req_title, 'complexity': 'medium',
@@ -710,7 +719,8 @@ def generate_test_points():
                     return jsonify({'error': f'飞书PRD拉取失败: {e}'}), 500
             with _agent_semaphore:
                 # 设计稿分析
-                design_ctx = _build_design_context(prd_url or '', [], raw_prd_text)
+                design_ctx = _build_design_context(prd_url or '', [], raw_prd_text,
+                                                   manual_design_text=design_text)
                 result = point_agent.execute({
                     'requirements': [{'function': 'all', 'name': 'PRD文档', 'complexity': 'medium',
                                       'test_points': ['功能逻辑'], 'description': raw_prd_text[:6000]}],
@@ -742,7 +752,8 @@ def generate_test_points():
             if data.get('structured_constraints'):
                 exec_input['structured_constraints'] = data['structured_constraints']
             if data.get('raw_prd'):
-                exec_input['design_context'] = _build_design_context('', [], data['raw_prd'])
+                exec_input['design_context'] = _build_design_context('', [], data['raw_prd'],
+                                                                     manual_design_text=design_text)
             with _agent_semaphore:
                 result = point_agent.execute(exec_input)
         elif query:
@@ -789,6 +800,7 @@ def _run_generate_in_background(task_id: str, payload: dict):
         _progress_log(f"========== Step 1/3: 加载测试点数据 task_id={task_id_in} ==========")
 
         design_urls = payload.get('design_urls') or []
+        design_text = payload.get('design_text') or ''
 
         # 从 history 查找测试点 JSON + 需求文档
         tp_json_path = None
@@ -909,7 +921,8 @@ def _run_generate_in_background(task_id: str, payload: dict):
             try:
                 sc = batch.get('shared_context') or {}
                 sc['requirement_context'] = requirement_context
-                design_context = _build_design_context(source_doc_url, design_urls, requirement_context)
+                design_context = _build_design_context(source_doc_url, design_urls, requirement_context,
+                                                       manual_design_text=design_text)
                 sc['yapi_context'] = yapi_context
                 sc['design_context'] = design_context
                 sc['past_batches_summary'] = _build_past_batches_summary(all_results)
@@ -1046,6 +1059,7 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
     doc_url = payload.get('doc_url', '')
     selected_platforms = _expand_platforms(payload.get('selected_platforms'))
     design_urls = payload.get('design_urls') or []
+    design_text = payload.get('design_text') or ''
 
     # ============ Step 1: 需求分析 ============
     try:
@@ -1104,7 +1118,8 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
 
         # 设计稿分析（在测试点生成前执行，让测试点也能参考 UI 元素）
         _plog("========== 设计稿分析 ==========")
-        design_context = _build_design_context(doc_url, design_urls, req_md_text)
+        design_context = _build_design_context(doc_url, design_urls, req_md_text,
+                                               manual_design_text=design_text)
 
         with _agent_semaphore:
             tp_result = point_agent.execute({
@@ -1219,7 +1234,8 @@ def _run_pipeline_in_background(pipeline_task_id: str, payload: dict):
             try:
                 sc = batch.get('shared_context') or {}
                 sc['requirement_context'] = req_md_text[:30000]
-                design_context = _build_design_context(doc_url, design_urls, req_md_text)
+                design_context = _build_design_context(doc_url, design_urls, req_md_text,
+                                                       manual_design_text=design_text)
                 sc['yapi_context'] = yapi_context
                 sc['design_context'] = design_context
                 sc['past_batches_summary'] = _build_past_batches_summary(all_results)
@@ -1335,6 +1351,7 @@ def pipeline_async():
 
     selected_platforms = data.get('selected_platforms') or None
     design_urls = data.get('design_urls') or []
+    design_text = data.get('design_text') or ''
 
     pipeline_task_id = f"PIPE-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     with _pipeline_tasks_lock:
@@ -1350,6 +1367,7 @@ def pipeline_async():
         'doc_url': doc_url,
         'selected_platforms': selected_platforms,
         'design_urls': design_urls,
+        'design_text': design_text,
         '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
     t = threading.Thread(target=_run_pipeline_in_background, args=(pipeline_task_id, payload), daemon=True)
@@ -1397,6 +1415,7 @@ def generate_test_async():
 
     selected_platforms = data.get('selected_platforms') or None  # 可选：如 ['client_common', 'backend']
     design_urls = data.get('design_urls') or []
+    design_text = data.get('design_text') or ''
 
     new_task_id = f"GEN-{task_id_in}-{datetime.now().strftime('%H%M%S')}"
     with _generation_tasks_lock:
@@ -1411,6 +1430,7 @@ def generate_test_async():
         'task_id': task_id_in,
         'selected_platforms': selected_platforms,
         'design_urls': design_urls,
+        'design_text': design_text,
         '_created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
     t = threading.Thread(target=_run_generate_in_background, args=(new_task_id, payload), daemon=True)
@@ -1505,6 +1525,7 @@ def generate_test():
         requirement_doc = data.get('requirement_doc', '')
         context = data.get('context', {})
         design_urls = data.get('design_urls') or []
+        design_text = data.get('design_text') or ''
 
         # ---- task_id 路径：从测试点 JSON 加载 batches 逐批生成 → 整合飞书 ----
         if task_id:
@@ -1605,7 +1626,8 @@ def generate_test():
                         # 注入需求文档 + YAPI + 前序 batch 摘要
                         sc = batch.get('shared_context') or {}
                         sc['requirement_context'] = requirement_context
-                        design_context = _build_design_context(source_doc_url, design_urls, requirement_context)
+                        design_context = _build_design_context(source_doc_url, design_urls, requirement_context,
+                                                               manual_design_text=design_text)
                         sc['yapi_context'] = yapi_context
                         sc['design_context'] = design_context
                         sc['past_batches_summary'] = _build_past_batches_summary(all_results)
@@ -2001,7 +2023,8 @@ def run_pipeline():
         if raw_prd:
             point_input['raw_prd'] = raw_prd
             # 设计稿分析（注入测试点生成）
-            point_input['design_context'] = _build_design_context(query, [], raw_prd)
+            point_input['design_context'] = _build_design_context(query, [], raw_prd,
+                                                                  manual_design_text=design_text)
         point_result = point_agent.execute(point_input)
         scenarios = point_result['scenarios']
         logger.info(f"测试点生成: {len(scenarios)}个场景")
@@ -2047,7 +2070,8 @@ def run_pipeline():
                     try:
                         sc = batch.get('shared_context') or {}
                         sc['requirement_context'] = raw_prd_text[:30000] if raw_prd_text else '（无）'
-                        design_context = _build_design_context(query if query and ('feishu.cn' in query or 'larksuite.com' in query) else '', data.get('design_urls') or [], raw_prd_text or '')
+                        design_context = _build_design_context(query if query and ('feishu.cn' in query or 'larksuite.com' in query) else '', data.get('design_urls') or [], raw_prd_text or '',
+                                                               manual_design_text=data.get('design_text') or '')
                         sc['yapi_context'] = yapi_context_pipe
                         sc['design_context'] = design_context
                         sc['past_batches_summary'] = _build_past_batches_summary(pipe_all_results)

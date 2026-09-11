@@ -383,6 +383,7 @@
                         <label style="font-size:13px"><input type="checkbox" class="pipe-cb" value="admin" checked> 管理后台</label>
                         <label style="font-size:13px;color:#999"><input type="checkbox" id="pipe-all-cb" checked onchange="document.querySelectorAll('.pipe-cb').forEach(c=>c.checked=this.checked)"> 全选/清空</label>
                     </div>
+                    <textarea id="pipeline-design-text" placeholder="✏️ 可选：手动输入 UI 设计稿说明（若填写，将代替 Figma API 请求流程，直接作为设计稿上下文）...&#10;例如：&#10;- 登录页：顶部Logo，中间用户名/密码输入框，右侧验证码&#10;- 列表页：顶部搜索栏，下方卡片列表，支持下拉刷新&#10;- 详情页：图片轮播 + 标题 + 价格 + 购买按钮" style="width:100%;min-height:80px;padding:8px 12px;border:1px solid #ddd;border-radius:4px;font-size:13px;margin-bottom:12px;background:#fffbe6"></textarea>
                     <div style="font-size:12px;color:#888;margin-bottom:12px">💡 填写飞书文档链接后点启动，系统会自动串联三阶段，中间无需人工干预</div>
                     <button class="btn" onclick="startPipeline()" id="pipeline-btn" style="background:linear-gradient(135deg,#fa8c16,#fa541c);color:white;font-weight:bold;padding:12px 32px;font-size:15px;border:none;box-shadow:0 2px 8px rgba(250,140,22,0.4)">
                         🚀 启动全流程
@@ -524,6 +525,9 @@
 
                     <label for="gen-doc">或手动输入需求文档（可选，无任务ID时使用）：</label>
                     <textarea id="gen-doc" placeholder="粘贴需求文档内容，或填写需求描述...\n例如：\n用户登录功能需求：\n1. 支持用户名密码登录\n2. 用户名长度6-20位\n3. 密码需包含大小写字母和数字\n4. 登录失败3次后锁定账户5分钟" style="min-height: 150px;"></textarea>
+
+                    <label for="gen-design-text">✏️ 手动输入 UI 设计稿（可选，若填写将代替 Figma API 请求流程）：</label>
+                    <textarea id="gen-design-text" placeholder="描述页面布局、控件、交互，例如：\n- 登录页：顶部Logo，中间用户名/密码输入框，右侧验证码\n- 列表页：顶部搜索栏，下方卡片列表，支持下拉刷新\n- 详情页：图片轮播 + 标题 + 价格 + 购买按钮" style="min-height: 80px;background:#fffbe6"></textarea>
                 </div>
 
                 <div class="input-section">
@@ -944,6 +948,7 @@
             const taskId = document.getElementById('gen-task-id').value.trim();
             const doc = document.getElementById('gen-doc').value.trim();
             const query = document.getElementById('gen-query').value.trim();
+            const designText = document.getElementById('gen-design-text').value.trim();
 
             if (!taskId && !doc && !query) {
                 alert('请输入任务ID，或需求文档/补充说明');
@@ -965,6 +970,7 @@
                         postBody.selected_platforms = selectedPlatforms;
                         console.log('[generateTest] 平台过滤:', selectedPlatforms);
                     }
+                    if (designText) postBody.design_text = designText;
                     const submitResp = await fetch('/api/generate_async', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
@@ -982,6 +988,7 @@
                 } else {
                     // 老路径：自然语言 → 同步
                     const body = {requirement_doc: doc, query: query};
+                    if (designText) body.design_text = designText;
                     const response = await fetch('/api/generate', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
@@ -1223,6 +1230,9 @@
             const docUrl = document.getElementById('pipeline-doc-url').value.trim();
             if (!docUrl) { alert('请输入飞书文档链接'); return; }
 
+            // 手动设计稿文本（可选）
+            const designText = document.getElementById('pipeline-design-text').value.trim();
+
             // 收集选端
             const cbs = document.querySelectorAll('.pipe-cb:checked');
             const selectedPlatforms = Array.from(cbs).map(cb => cb.value);
@@ -1260,7 +1270,7 @@
                 const submitResp = await fetch('/api/pipeline_async', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({doc_url: docUrl, selected_platforms: selectedPlatforms})
+                    body: JSON.stringify({doc_url: docUrl, selected_platforms: selectedPlatforms, design_text: designText})
                 });
                 const submitData = await submitResp.json();
                 if (!submitData.success) {
